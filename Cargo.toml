@@ -1,0 +1,3 @@
+[workspace]
+members = ["hip-sys", "hip-runtime", "candle-backend"]
+resolver = "2"

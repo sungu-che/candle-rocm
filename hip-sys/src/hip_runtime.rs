@@ -1,0 +1,1 @@
+//! HIP runtime FFI bindings.

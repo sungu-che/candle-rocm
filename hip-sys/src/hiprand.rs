@@ -1,0 +1,1 @@
+//! hipRAND FFI bindings.

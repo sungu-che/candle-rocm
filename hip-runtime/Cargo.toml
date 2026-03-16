@@ -1,0 +1,9 @@
+[package]
+name = "hip-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust wrappers for AMD HIP runtime"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+hip-sys = { path = "../hip-sys" }

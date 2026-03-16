@@ -1,0 +1,1 @@
+//! BackendDevice implementation for ROCm.

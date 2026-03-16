@@ -1,0 +1,10 @@
+[package]
+name = "candle-rocm"
+version = "0.1.0"
+edition = "2021"
+description = "ROCm/HIP backend for candle ML framework"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+hip-runtime = { path = "../hip-runtime" }
+candle-core = { version = "0.8" }
