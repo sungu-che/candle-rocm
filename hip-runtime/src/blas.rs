@@ -94,6 +94,87 @@ impl RocBlas {
             )
         })
     }
+
+    /// Raw-pointer SGEMM for type-erased storage (e.g., `DeviceBuffer<u8>`).
+    ///
+    /// # Safety
+    /// Caller must ensure pointers reference valid f32 GPU memory with correct dimensions.
+    pub unsafe fn sgemm_raw(
+        &self,
+        trans_a: bool,
+        trans_b: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: *const std::ffi::c_void,
+        lda: usize,
+        b: *const std::ffi::c_void,
+        ldb: usize,
+        beta: f32,
+        c: *mut std::ffi::c_void,
+        ldc: usize,
+    ) -> Result<()> {
+        let op = |t| if t {
+            rocblas::rocblas_operation::rocblas_operation_transpose
+        } else {
+            rocblas::rocblas_operation::rocblas_operation_none
+        };
+
+        check_rocblas(rocblas::rocblas_sgemm(
+            self.handle,
+            op(trans_a), op(trans_b),
+            m as i32, n as i32, k as i32,
+            &alpha,
+            a, lda as i32,
+            b, ldb as i32,
+            &beta,
+            c, ldc as i32,
+        ))
+    }
+
+    /// Raw-pointer batched strided SGEMM.
+    ///
+    /// # Safety
+    /// Same requirements as `sgemm_raw`, plus stride/batch constraints.
+    pub unsafe fn sgemm_strided_batched_raw(
+        &self,
+        trans_a: bool,
+        trans_b: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: *const std::ffi::c_void,
+        lda: usize,
+        stride_a: i64,
+        b: *const std::ffi::c_void,
+        ldb: usize,
+        stride_b: i64,
+        beta: f32,
+        c: *mut std::ffi::c_void,
+        ldc: usize,
+        stride_c: i64,
+        batch_count: usize,
+    ) -> Result<()> {
+        let op = |t| if t {
+            rocblas::rocblas_operation::rocblas_operation_transpose
+        } else {
+            rocblas::rocblas_operation::rocblas_operation_none
+        };
+
+        check_rocblas(rocblas::rocblas_sgemm_strided_batched(
+            self.handle,
+            op(trans_a), op(trans_b),
+            m as i32, n as i32, k as i32,
+            &alpha,
+            a, lda as i32, stride_a,
+            b, ldb as i32, stride_b,
+            &beta,
+            c, ldc as i32, stride_c,
+            batch_count as i32,
+        ))
+    }
 }
 
 impl Drop for RocBlas {
