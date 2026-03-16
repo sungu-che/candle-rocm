@@ -1,1 +1,0 @@
-//! BackendStorage implementation for ROCm.
