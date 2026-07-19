@@ -1,13 +1,21 @@
 # candle-rocm
 
-ROCm/HIP backend for the [candle](https://github.com/huggingface/candle) ML framework. Run candle tensor operations on AMD GPUs.
+ROCm/HIP backend for the [candle](https://github.com/huggingface/candle) ML framework. Run candle tensor operations on AMD GPUs using HIP kernels and rocBLAS.
 
 ## Requirements
 
 - AMD GPU with ROCm support
 - ROCm 5.x+ with HIP runtime and rocBLAS
 - `hipcc` on PATH (for kernel compilation)
-- Set `HIP_ARCH` to your GPU architecture (e.g. `gfx1010` for RX 5700 XT, `gfx1030` for RX 6900 XT, `gfx1100` for RX 7900 XTX)
+- Set `HIP_ARCH` to your GPU architecture:
+
+  | GPU | `HIP_ARCH` |
+  |-----|------------|
+  | RX 5700 XT | `gfx1010` |
+  | RX 6900 XT | `gfx1030` |
+  | RX 7900 XTX | `gfx1100` |
+
+  Default is `gfx1030`.
 
 ## Usage
 
@@ -19,10 +27,10 @@ candle-rocm = { git = "https://github.com/vuongthai91/candle-rocm" }
 ```
 
 ```rust
-use candle_rocm::{Tensor, DType};
+use candle_rocm::{Device, Tensor, DType};
 
 fn main() -> candle_rocm::Result<()> {
-    let dev = candle_rocm::device(0)?;
+    let dev = Device::new_rocm(0)?;
     let a = Tensor::randn(0f32, 1., (128, 64), &dev)?;
     let b = Tensor::randn(0f32, 1., (64, 256), &dev)?;
     let c = a.matmul(&b)?;
@@ -31,7 +39,7 @@ fn main() -> candle_rocm::Result<()> {
 }
 ```
 
-### Feature flag
+### Feature flag (use with candle-core)
 
 ```toml
 [dependencies]
@@ -53,33 +61,62 @@ fn main() -> candle_core::Result<()> {
 ```rust
 candle_rocm::is_available()       // true if a ROCm GPU is present
 candle_rocm::device_count()?      // number of GPUs
-candle_rocm::device_name(0)?      // e.g. "AMD Radeon RX 5700 XT"
+candle_rocm::device_name(0)?      // e.g. "AMD Radeon RX 6900 XT"
 candle_rocm::total_vram(0)?       // VRAM in bytes
 ```
 
 ## Supported operations
 
-- **Unary**: neg, abs, exp, log, sin, cos, tanh, sqrt, gelu, relu, ceil, floor, round, sigmoid, silu, and more
-- **Binary**: add, sub, mul, div, min, max
-- **Comparison**: eq, ne, lt, le, gt, ge
-- **Reduce**: sum, max, min, argmax, argmin (arbitrary dimensions)
-- **Matmul**: rocBLAS sgemm (f32), CPU fallback for other dtypes
-- **Type casting**: all dtype pairs via HIP kernels
-- **Indexing**: gather, scatter_add, index_select, index_add
-- **Other**: affine, where_cond, copy_strided, powf, elu
+**Arithmetic / Unary**: `neg`, `abs`, `exp`, `log`, `sin`, `cos`, `tanh`, `sqrt`, `gelu`, `relu`, `ceil`, `floor`, `round`, `sigmoid`, `silu`, `elu`, `powf`
 
-Operations not yet GPU-accelerated (conv, pool, upsample) fall back to CPU automatically.
+**Binary**: `add`, `sub`, `mul`, `div`, `min`, `max`
+
+**Comparison**: `eq`, `ne`, `lt`, `le`, `gt`, `ge`
+
+**Reduce**: `sum`, `max`, `min`, `argmax`, `argmin` (arbitrary dimensions)
+
+**Matmul / GEMM**:
+- `rocBLAS sgemm` (f32, batched strided)
+- `rocBLAS hgemm` (f16, batched strided)
+- `rocBLAS gemm_ex` (BF16 I/O, F32 compute)
+- **FP8 GEMM** — fused dequant + matmul via custom HIP kernel (F8E4M3 → F16)
+
+**Custom HIP kernels** (GPU-native, no CPU fallback):
+- **RMSNorm** — F32, BF16, F16 variants (`rmsnorm_f32`, `rmsnorm_bf16`, `rmsnorm_f16`)
+- **Softmax** — F32 softmax on last dim
+- **Conv2D** — im2col + bias_add, F32 and F16
+- **Dequant** — Q4_0, Q8_0, Q4_K, Q8_K from GGUF quantized weights → F16 on GPU
+- **GroupNorm** — F32 group normalization
+- **Element-wise** — unary, binary, reduce, fill (all dtypes)
+- **Type casting** — all dtype pairs
+
+**Quantized weights**: FP8 (F8E4M3), BF16, F16, F32, I8, I16, I32, I64, U8, U32
+
+**Other**: `affine`, `where_cond`, `copy_strided`, `index_select`, `index_add`, `scatter_add`, `gather`
+
+Operations not yet GPU-accelerated fall back to CPU automatically.
 
 ## Architecture
 
 ```
 candle-rocm/
-├── candle-backend/   # convenience crate (candle-rocm), re-exports candle-core + ROCm utilities
-├── candle-core/      # forked candle-core with rocm feature flag
-├── hip-runtime/      # safe Rust wrappers for HIP runtime, rocBLAS, hipRAND
-├── hip-sys/          # raw FFI bindings to HIP/rocBLAS/hipRAND
-├── kernels/          # HIP C++ kernels (.hip files)
-└── poc/              # proof-of-concept examples
+├── candle-backend/       # convenience crate (candle-rocm), re-exports candle-core + ROCm utilities
+├── candle-core/          # forked candle-core with rocm feature flag
+│   └── src/rocm_backend/ # RocmDevice, RocmStorage, custom op dispatch
+├── hip-runtime/          # safe Rust wrappers for HIP runtime, rocBLAS, hipRAND
+├── hip-sys/              # raw FFI bindings to HIP/rocBLAS/hipRAND
+├── kernels/              # HIP C++ kernels (.hip files compiled to .hsaco)
+└── poc/                  # proof-of-concept examples
+```
+
+### GPU kernel flow
+
+Custom ops are dispatched from `RocmStorage` to GPU kernels via `custom_op1_gpu` / `custom_op2_gpu`. When no GPU kernel exists for an op, execution falls back to `CpuStorage` (CPU) automatically.
+
+```
+Tensor → Storage::Rocm(RocmStorage)
+  → custom_op1_gpu / custom_op2_gpu → HipModule::launch(kernel)
+  → fallback: to_cpu() → CpuStorage op → DeviceBuffer::from_slice upload
 ```
 
 ## License
