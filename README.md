@@ -4,18 +4,19 @@ ROCm/HIP backend for the [candle](https://github.com/huggingface/candle) ML fram
 
 ## Requirements
 
-- AMD GPU with ROCm support
-- ROCm 5.x+ with HIP runtime and rocBLAS
-- `hipcc` on PATH (for kernel compilation)
-- Set `HIP_ARCH` to your GPU architecture:
+### ROCm version by GPU architecture
 
-  | GPU | `HIP_ARCH` |
-  |-----|------------|
-  | RX 5700 XT | `gfx1010` |
-  | RX 6900 XT | `gfx1030` |
-  | RX 7900 XTX | `gfx1100` |
+| GPU family | Architecture | Recommended ROCm |
+|------------|-------------|------------------|
+| RX 6000–7000 series (RDNA2) | `gfx1030`, `gfx1031`, `gfx1032` | **7.1+** |
+| RX 7900 series (RDNA3) | `gfx1100`, `gfx1101`, `gfx1102` | **7.1+** |
+| MI100, MI200 (CDNA 1–2) | `gfx908`, `gfx90a` | **6.x** (e.g. 6.2.4) |
+| MI200 (CDNA 2) | `gfx90a` | **6.x** (e.g. 6.2.4) |
 
-  Default is `gfx1030`.
+- **RDNA2/3** (gfx1030+): ROCm 7.1+ from [rocm.com](https://rocm.docs.amd.com/en/latest/deploy/linux/install.html)
+- **CDNA 1–2** (gfx908/90a): Use ROCm 6.x — install HIP SDK manually or from your distro. ROCm 7.x has limited CDNA1 support.
+- Set `HIP_ARCH` to match your GPU architecture (see table above). Default is `gfx1030`.
+- `hipcc` on PATH for kernel compilation.
 
 ## Usage
 
