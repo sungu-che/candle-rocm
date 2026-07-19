@@ -2,7 +2,7 @@
 // Produces high-quality uniform random f32 values.
 // Deterministic: same (seed, offset) always produces same output.
 
-#include <hip/hip_runtime.h>
+#include "hip_utils.h"
 
 // Philox round function constants
 #define PHILOX_M0 0xD2511F53u

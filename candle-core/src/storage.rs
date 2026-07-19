@@ -1,7 +1,11 @@
 use crate::backend::BackendStorage;
 use crate::op::{self, CmpOp, ReduceOp};
-use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, RocmStorage, Result, Shape};
+use crate::scalar::Scalar;
+use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, Result, Shape};
 use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
+use crate::RocmStorage;
+
+
 
 // We do not want to implement Clone on Storage as cloning may fail because of
 // out of memory. Instead try_clone should be used.
@@ -10,7 +14,7 @@ pub enum Storage {
     Cpu(CpuStorage),
     Cuda(CudaStorage),
     Metal(MetalStorage),
-    Rocm(RocmStorage),
+    Rocm(crate::RocmStorage),
 }
 
 impl Storage {
@@ -56,6 +60,9 @@ impl Storage {
         let lhs = lhs_device.location();
         let rhs = rhs_device.location();
         let same_device = if self.device().is_metal() {
+            // On metal, we require the device to be exactly the same rather than
+            // having the same location. In cuda this is not necessary as all CudaDevice on the
+            // same GPU will use the same cuda stream.
             lhs_device.same_device(&rhs_device)
         } else {
             lhs == rhs
@@ -74,6 +81,15 @@ impl Storage {
             Err(Error::DTypeMismatchBinaryOp { lhs, rhs, op }.bt())
         } else {
             Ok(())
+        }
+    }
+
+    pub(crate) fn const_set(&mut self, v: Scalar, l: &Layout) -> Result<()> {
+        match self {
+            Storage::Cpu(storage) => storage.const_set(v, l),
+            Storage::Cuda(storage) => storage.const_set(v, l),
+            Storage::Metal(storage) => storage.const_set(v, l),
+            Storage::Rocm(storage) => storage.const_set(v, l),
         }
     }
 
@@ -167,6 +183,8 @@ impl Storage {
                 Ok(Self::Rocm(storage))
             }
             (lhs, rhs) => {
+                // Should not happen because of the same device check above but we're defensive
+                // anyway.
                 Err(Error::DeviceMismatchBinaryOp {
                     lhs: lhs.device().location(),
                     rhs: rhs.device().location(),
@@ -233,11 +251,23 @@ impl Storage {
                 let (storage, shape) = c.metal_fwd(storage, l)?;
                 Ok((Self::Metal(storage), shape))
             }
-            Self::Rocm(_storage) => {
-                // CustomOps fall back to CPU for now
-                let cpu_storage = self.to_cpu(l)?;
+            Self::Rocm(storage) => {
+                // Fast path: dispatch known CustomOp1 ops to GPU kernels.
+                if let Some(result) = storage.custom_op1_gpu(l, c.name())? {
+                    return Ok((Self::Rocm(result), l.shape().clone()));
+                }
+                // Try trait-level ROCm implementation (e.g. QMatMul).
+                match c.rocm_fwd(storage, l) {
+                    Ok(result) => return Ok((Self::Rocm(result.0), result.1)),
+                    Err(_) => {} // fall through to CPU
+                }
+                // Fallback: CPU
+                use crate::backend::{BackendDevice, BackendStorage};
+                let cpu_storage = storage.to_cpu_storage()?;
                 let (result, shape) = c.cpu_fwd(&cpu_storage, l)?;
-                Ok((Self::Cpu(result), shape))
+                let device = storage.device().clone();
+                let rocm_result = device.storage_from_cpu_storage(&result)?;
+                Ok((Self::Rocm(rocm_result), shape))
             }
         }
     }
@@ -250,6 +280,15 @@ impl Storage {
         c: &dyn CustomOp2,
     ) -> Result<(Self, Shape)> {
         self.same_device(t2, c.name())?;
+        // Auto-cast FP8 for custom ops (e.g. RmsNorm).
+        if self.dtype() == DType::F8E4M3 && t2.dtype() != DType::F8E4M3 {
+            let s1_cast = self.to_dtype(l1, t2.dtype())?;
+            return s1_cast.apply_op2(l1, t2, l2, c);
+        }
+        if t2.dtype() == DType::F8E4M3 && self.dtype() != DType::F8E4M3 {
+            let t2_cast = t2.to_dtype(l2, self.dtype())?;
+            return self.apply_op2(l1, &t2_cast, l2, c);
+        }
         match (self, t2) {
             (Self::Cpu(s1), Self::Cpu(s2)) => {
                 let (s, shape) = c.cpu_fwd(s1, l1, s2, l2)?;
@@ -263,11 +302,19 @@ impl Storage {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2)?;
                 Ok((Self::Metal(s), shape))
             }
-            (Self::Rocm(_), Self::Rocm(_)) => {
-                let cpu1 = self.to_cpu(l1)?;
-                let cpu2 = t2.to_cpu(l2)?;
-                let (s, shape) = c.cpu_fwd(&cpu1, l1, &cpu2, l2)?;
-                Ok((Self::Cpu(s), shape))
+            (Self::Rocm(s1), Self::Rocm(s2)) => {
+                // Fast path: dispatch known ops to GPU kernels.
+                if let Some(result) = s1.custom_op2_gpu(l1, c.name(), s2, l2)? {
+                    return Ok((Self::Rocm(result), l1.shape().clone()));
+                }
+                // Fallback: CPU
+                use crate::backend::{BackendDevice, BackendStorage};
+                let cpu1 = s1.to_cpu_storage()?;
+                let cpu2 = s2.to_cpu_storage()?;
+                let (result, shape) = c.cpu_fwd(&cpu1, l1, &cpu2, l2)?;
+                let device = s1.device().clone();
+                let rocm_result = device.storage_from_cpu_storage(&result)?;
+                Ok((Self::Rocm(rocm_result), shape))
             }
             _ => unreachable!(),
         }
@@ -297,12 +344,15 @@ impl Storage {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2, s3, l3)?;
                 Ok((Self::Metal(s), shape))
             }
-            (Self::Rocm(_), Self::Rocm(_), Self::Rocm(_)) => {
-                let cpu1 = self.to_cpu(l1)?;
-                let cpu2 = t2.to_cpu(l2)?;
-                let cpu3 = t3.to_cpu(l3)?;
-                let (s, shape) = c.cpu_fwd(&cpu1, l1, &cpu2, l2, &cpu3, l3)?;
-                Ok((Self::Cpu(s), shape))
+            (Self::Rocm(s1), Self::Rocm(s2), Self::Rocm(s3)) => {
+                use crate::backend::{BackendDevice, BackendStorage};
+                let cpu1 = s1.to_cpu_storage()?;
+                let cpu2 = s2.to_cpu_storage()?;
+                let cpu3 = s3.to_cpu_storage()?;
+                let (result, shape) = c.cpu_fwd(&cpu1, l1, &cpu2, l2, &cpu3, l3)?;
+                let device = s1.device().clone();
+                let rocm_result = device.storage_from_cpu_storage(&result)?;
+                Ok((Self::Rocm(rocm_result), shape))
             }
             _ => unreachable!(),
         }
@@ -313,7 +363,13 @@ impl Storage {
             Self::Cpu(storage) => c.cpu_fwd(storage, l),
             Self::Cuda(storage) => c.cuda_fwd(storage, l),
             Self::Metal(storage) => c.metal_fwd(storage, l),
-            Self::Rocm(_storage) => crate::bail!("inplace ops not yet supported on Rocm"),
+            Self::Rocm(storage) => {
+                use crate::backend::BackendStorage;
+                let mut cpu_storage = storage.to_cpu_storage()?;
+                c.cpu_fwd(&mut cpu_storage, l)?;
+                storage.replace_from_cpu_storage(&cpu_storage)?;
+                Ok(())
+            }
         }
     }
 
@@ -329,7 +385,14 @@ impl Storage {
             (Self::Cpu(s1), Self::Cpu(s2)) => c.cpu_fwd(s1, l1, s2, l2),
             (Self::Cuda(s1), Self::Cuda(s2)) => c.cuda_fwd(s1, l1, s2, l2),
             (Self::Metal(s1), Self::Metal(s2)) => c.metal_fwd(s1, l1, s2, l2),
-            (Self::Rocm(_), Self::Rocm(_)) => crate::bail!("inplace ops not yet supported on Rocm"),
+            (Self::Rocm(s1), Self::Rocm(s2)) => {
+                use crate::backend::BackendStorage;
+                let mut cpu1 = s1.to_cpu_storage()?;
+                let cpu2 = s2.to_cpu_storage()?;
+                c.cpu_fwd(&mut cpu1, l1, &cpu2, l2)?;
+                s1.replace_from_cpu_storage(&cpu1)?;
+                Ok(())
+            }
             _ => unreachable!(),
         }
     }
@@ -351,8 +414,14 @@ impl Storage {
             (Self::Metal(s1), Self::Metal(s2), Self::Metal(s3)) => {
                 c.metal_fwd(s1, l1, s2, l2, s3, l3)
             }
-            (Self::Rocm(_), Self::Rocm(_), Self::Rocm(_)) => {
-                crate::bail!("inplace ops not yet supported on Rocm")
+            (Self::Rocm(s1), Self::Rocm(s2), Self::Rocm(s3)) => {
+                use crate::backend::BackendStorage;
+                let mut cpu1 = s1.to_cpu_storage()?;
+                let cpu2 = s2.to_cpu_storage()?;
+                let cpu3 = s3.to_cpu_storage()?;
+                c.cpu_fwd(&mut cpu1, l1, &cpu2, l2, &cpu3, l3)?;
+                s1.replace_from_cpu_storage(&cpu1)?;
+                Ok(())
             }
             _ => unreachable!(),
         }
@@ -386,6 +455,18 @@ impl Storage {
         rhs_layout: &Layout,
     ) -> Result<Self> {
         self.same_device(rhs, B::NAME)?;
+        // Auto-cast FP8 operands for binary ops (add, mul, etc.).
+        // When one side is F8E4M3, cast it to the other side's dtype.
+        let lhs_dt = self.dtype();
+        let rhs_dt = rhs.dtype();
+        if lhs_dt == DType::F8E4M3 && rhs_dt != DType::F8E4M3 {
+            let lhs_cast = self.to_dtype(lhs_layout, rhs_dt)?;
+            return lhs_cast.binary_impl::<B>(rhs, lhs_layout, rhs_layout);
+        }
+        if rhs_dt == DType::F8E4M3 && lhs_dt != DType::F8E4M3 {
+            let rhs_cast = rhs.to_dtype(rhs_layout, lhs_dt)?;
+            return self.binary_impl::<B>(&rhs_cast, lhs_layout, rhs_layout);
+        }
         self.same_dtype(rhs, B::NAME)?;
         match (self, rhs) {
             (Storage::Cpu(lhs), Storage::Cpu(rhs)) => {
@@ -405,6 +486,8 @@ impl Storage {
                 Ok(Self::Rocm(storage))
             }
             (lhs, rhs) => {
+                // Should not happen because of the same device check above but we're defensive
+                // anyway.
                 Err(Error::DeviceMismatchBinaryOp {
                     lhs: lhs.device().location(),
                     rhs: rhs.device().location(),
@@ -649,6 +732,39 @@ impl Storage {
         }
     }
 
+    pub(crate) fn upsample_bilinear2d(
+        &self,
+        layout: &Layout,
+        h: usize,
+        w: usize,
+        align_corners: bool,
+        scale_h: Option<f64>,
+        scale_w: Option<f64>,
+    ) -> Result<Self> {
+        match self {
+            Storage::Cpu(storage) => {
+                let storage =
+                    storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+                Ok(Self::Cpu(storage))
+            }
+            Self::Cuda(storage) => {
+                let storage =
+                    storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+                Ok(Self::Cuda(storage))
+            }
+            Self::Metal(storage) => {
+                let storage =
+                    storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+                Ok(Self::Metal(storage))
+            }
+            Self::Rocm(storage) => {
+                let storage =
+                    storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+                Ok(Self::Rocm(storage))
+            }
+        }
+    }
+
     pub(crate) fn where_cond(
         &self,
         layout: &Layout,
@@ -715,36 +831,62 @@ impl Storage {
         }
     }
 
-    pub(crate) fn scatter_add(
-        &self,
+    pub(crate) fn scatter_set(
+        &mut self,
         l: &Layout,
         indexes: &Self,
         indexes_l: &Layout,
         source: &Self,
         source_l: &Layout,
         d: usize,
-    ) -> Result<Self> {
+    ) -> Result<()> {
+        self.same_device(indexes, "scatter-set")?;
+        self.same_device(source, "scatter-set")?;
+        match (self, indexes, source) {
+            (Self::Cpu(s), Self::Cpu(indexes), Self::Cpu(source)) => {
+                s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::Cuda(s), Self::Cuda(indexes), Self::Cuda(source)) => {
+                s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::Metal(s), Self::Metal(indexes), Self::Metal(source)) => {
+                s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::Rocm(s), Self::Rocm(indexes), Self::Rocm(source)) => {
+                s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn scatter_add(
+        &mut self,
+        l: &Layout,
+        indexes: &Self,
+        indexes_l: &Layout,
+        source: &Self,
+        source_l: &Layout,
+        d: usize,
+    ) -> Result<()> {
         self.same_device(indexes, "scatter-add")?;
         self.same_device(source, "scatter-add")?;
         match (self, indexes, source) {
             (Self::Cpu(s), Self::Cpu(indexes), Self::Cpu(source)) => {
-                let storage = s.scatter_add(l, indexes, indexes_l, source, source_l, d)?;
-                Ok(Self::Cpu(storage))
+                s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
             }
             (Self::Cuda(s), Self::Cuda(indexes), Self::Cuda(source)) => {
-                let storage = s.scatter_add(l, indexes, indexes_l, source, source_l, d)?;
-                Ok(Self::Cuda(storage))
+                s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
             }
             (Self::Metal(s), Self::Metal(indexes), Self::Metal(source)) => {
-                let storage = s.scatter_add(l, indexes, indexes_l, source, source_l, d)?;
-                Ok(Self::Metal(storage))
+                s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
             }
             (Self::Rocm(s), Self::Rocm(indexes), Self::Rocm(source)) => {
-                let storage = s.scatter_add(l, indexes, indexes_l, source, source_l, d)?;
-                Ok(Self::Rocm(storage))
+                s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
             }
             _ => unreachable!(),
         }
+        Ok(())
     }
 
     pub(crate) fn index_add(
@@ -821,7 +963,22 @@ impl Storage {
         rhs_layout: &Layout,
     ) -> Result<Self> {
         self.same_device(rhs, "matmul")?;
-        self.same_dtype(rhs, "matmul")?;
+        // Allow mixed FP8 × BF16/F16 for "manual cast" FP8 inference.
+        // The CUDA backend handles casting FP8 → compute dtype on the fly.
+        let lhs_dt = self.dtype();
+        let rhs_dt = rhs.dtype();
+        let fp8_mixed = (lhs_dt == DType::F8E4M3 || rhs_dt == DType::F8E4M3)
+            && lhs_dt != rhs_dt
+            && matches!(
+                (lhs_dt, rhs_dt),
+                (DType::F8E4M3, DType::BF16)
+                    | (DType::BF16, DType::F8E4M3)
+                    | (DType::F8E4M3, DType::F16)
+                    | (DType::F16, DType::F8E4M3)
+            );
+        if !fp8_mixed {
+            self.same_dtype(rhs, "matmul")?;
+        }
         match (self, rhs) {
             (Self::Cpu(lhs), Self::Cpu(rhs)) => {
                 let storage = lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout)?;
@@ -901,15 +1058,6 @@ impl Storage {
                 op: "copy2d",
             }
             .bt()),
-        }
-    }
-
-    fn to_cpu(&self, layout: &Layout) -> Result<CpuStorage> {
-        match self {
-            Self::Cpu(storage) => Ok(storage.clone()),
-            Self::Cuda(storage) => storage.to_cpu_storage(),
-            Self::Metal(storage) => storage.to_cpu_storage(),
-            Self::Rocm(storage) => storage.to_cpu_storage(),
         }
     }
 }

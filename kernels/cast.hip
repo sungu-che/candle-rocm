@@ -1,4 +1,5 @@
 #include "hip_utils.h"
+#include <hip/hip_fp16.h>
 
 // Type casting kernels
 #define CAST_OP(NAME, SRC_T, DST_T)                                              \
@@ -27,6 +28,10 @@ CAST_OP(cast_u8_f32, uint8_t, float)
 CAST_OP(cast_u32_f32, uint32_t, float)
 CAST_OP(cast_i64_f32, int64_t, float)
 CAST_OP(cast_f64_f32, double, float)
+
+// f16 conversions (attention bottleneck — to_dtype F16↔F32)
+CAST_OP(cast_f16_f32, __half, float)
+CAST_OP(cast_f32_f16, float, __half)
 
 // u32/i64 conversions (used for index types)
 CAST_OP(cast_u32_i64, uint32_t, int64_t)

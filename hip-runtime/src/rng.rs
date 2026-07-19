@@ -15,6 +15,9 @@ pub struct HipRng {
     offset: u64,
 }
 
+unsafe impl Send for HipRng {}
+unsafe impl Sync for HipRng {}
+
 impl HipRng {
     /// Create RNG with a seed. `kernel_dir` is the path to the kernels/ directory.
     pub fn new(seed: u64, kernel_dir: &Path) -> Result<Self> {

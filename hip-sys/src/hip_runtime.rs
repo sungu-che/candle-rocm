@@ -78,5 +78,9 @@ extern "C" {
         kernel_params: *mut *mut c_void,
         extra: *mut *mut c_void,
     ) -> hipError_t;
+
+    /// Query free and total device memory in bytes.
+    /// Both pointers must be valid. Returns HIP_SUCCESS on success.
+    pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> hipError_t;
     pub fn hipGetErrorString(error: hipError_t) -> *const std::os::raw::c_char;
 }

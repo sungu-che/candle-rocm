@@ -1,5 +1,4 @@
 #include "hip_utils.h"
-#include <math.h>
 #include <float.h>
 
 // Numerically stable softmax: one block per row.
@@ -22,12 +21,12 @@ extern "C" __global__ void softmax_f32(
     // Phase 1: find max
     float local_max = -FLT_MAX;
     for (size_t c = tid; c < ncols; c += blockDim.x) {
-        local_max = fmaxf(local_max, row_inp[c]);
+        local_max = (local_max > row_inp[c] ? local_max : row_inp[c]);
     }
     shr[tid] = local_max;
     __syncthreads();
     for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) shr[tid] = fmaxf(shr[tid], shr[tid + s]);
+        if (tid < s) shr[tid] = (shr[tid] > shr[tid + s] ? shr[tid] : shr[tid + s]);
         __syncthreads();
     }
     float row_max = shr[0];
@@ -70,12 +69,12 @@ extern "C" __global__ void log_softmax_f32(
     // Phase 1: find max
     float local_max = -FLT_MAX;
     for (size_t c = tid; c < ncols; c += blockDim.x) {
-        local_max = fmaxf(local_max, row_inp[c]);
+        local_max = (local_max > row_inp[c] ? local_max : row_inp[c]);
     }
     shr[tid] = local_max;
     __syncthreads();
     for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) shr[tid] = fmaxf(shr[tid], shr[tid + s]);
+        if (tid < s) shr[tid] = (shr[tid] > shr[tid + s] ? shr[tid] : shr[tid + s]);
         __syncthreads();
     }
     float row_max = shr[0];

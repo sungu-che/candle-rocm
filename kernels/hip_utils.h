@@ -29,3 +29,41 @@ __device__ __forceinline__ bool is_contiguous(const size_t *info) {
 
 // Launch config helper: 256 threads/block, enough blocks to cover numel
 #define LAUNCH_CFG(numel) dim3((((numel) + 255) / 256)), dim3(256)
+
+// On Ubuntu-packaged ROCm, glibc <math.h> declares host-only math functions
+// that conflict with HIP device intrinsics. Declare device-side versions
+// using LLVM intrinsics and OCML (AMD's OpenCL Math Library) for functions
+// without LLVM intrinsics (like tanhf, erff, powf).
+#ifdef __HIP_DEVICE_COMPILE__
+extern "C" {
+// LLVM intrinsics (always available)
+__device__ float expf(float) __asm__("llvm.exp.f32");
+__device__ float logf(float) __asm__("llvm.log.f32");
+__device__ float sinf(float) __asm__("llvm.sin.f32");
+__device__ float cosf(float) __asm__("llvm.cos.f32");
+__device__ float fabsf(float) __asm__("llvm.fabs.f32");
+__device__ float ceilf(float) __asm__("llvm.ceil.f32");
+__device__ float floorf(float) __asm__("llvm.floor.f32");
+__device__ float roundf(float) __asm__("llvm.round.f32");
+__device__ float truncf(float) __asm__("llvm.trunc.f32");
+__device__ float fmaxf(float, float) __asm__("llvm.maxnum.f32");
+__device__ float fminf(float, float) __asm__("llvm.minnum.f32");
+
+// OCML functions (tanhf, erff, powf): provided by __clang_hip_math.h when
+// compiled via Rust (-include hip/hip_runtime.h), but missing on standalone
+// hipcc --genco. Use OCML directly to avoid glibc __host__ conflict.
+// Guard: skip if __clang_hip_math.h already defined them.
+#ifdef __HIP_DEVICE_COMPILE__
+#ifndef __CLANG_HIP_MATH_H__
+extern "C" {
+__device__ float __ocml_tanh_f32(float);
+__device__ float __ocml_erf_f32(float);
+__device__ float __ocml_pow_f32(float, float);
+}
+__device__ __forceinline__ float tanhf(float x) { return __ocml_tanh_f32(x); }
+__device__ __forceinline__ float erff(float x) { return __ocml_erf_f32(x); }
+__device__ __forceinline__ float powf(float x, float y) { return __ocml_pow_f32(x, y); }
+#endif
+#endif
+}
+#endif

@@ -22,6 +22,8 @@ pub mod cuda;
 mod cuda {
     pub use super::dummy_cuda::*;
 }
+#[cfg(feature = "rocm")]
+pub mod gpu_dequant;
 
 #[cfg(target_feature = "neon")]
 pub mod neon;
@@ -149,6 +151,7 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    BF16,
 }
 
 impl GgmlDType {
@@ -168,6 +171,7 @@ impl GgmlDType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            30 => Self::BF16,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
         Ok(dtype)
@@ -189,6 +193,7 @@ impl GgmlDType {
             Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Q8K => 15,
+            Self::BF16 => 30,
         }
     }
 
@@ -208,6 +213,7 @@ impl GgmlDType {
             Self::Q4K => Box::new(vec![BlockQ4K::zeros(); elem_count / BlockQ4K::BLCK_SIZE]),
             Self::Q5K => Box::new(vec![BlockQ5K::zeros(); elem_count / BlockQ5K::BLCK_SIZE]),
             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
+            Self::BF16 => Box::new(vec![half::bf16::ZERO; elem_count]),
             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
         }
     }
@@ -228,6 +234,7 @@ impl GgmlDType {
             Self::Q3K => std::mem::size_of::<BlockQ3K>(),
             Self::Q4K => std::mem::size_of::<BlockQ4K>(),
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
+            Self::BF16 => std::mem::size_of::<half::bf16>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
         }
@@ -245,6 +252,7 @@ impl GgmlDType {
             Self::Q8_0 => k_quants::QK8_0,
             Self::Q8_1 => k_quants::QK8_1,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
+            Self::BF16 => 1,
         }
     }
 }
@@ -272,7 +280,8 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
     }
 
     fn from_float(&mut self, xs: &[f32]) -> Result<()> {
-        T::from_float(xs, self)
+        T::from_float(xs, self);
+        Ok(())
     }
 
     fn dtype(&self) -> GgmlDType {
@@ -285,7 +294,7 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
 
     fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
         let mut ys = vec![0.0f32; elem_count];
-        T::to_float(self.as_slice(), &mut ys)?;
+        T::to_float(self.as_slice(), &mut ys);
         Ok(CpuStorage::F32(ys))
     }
 
@@ -326,6 +335,11 @@ impl QTensor {
     }
 
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
+        Self::quantize_onto(src, dtype, src.device())
+    }
+
+    /// Quantize a tensor onto a specific device.
+    pub fn quantize_onto(src: &Tensor, dtype: GgmlDType, device: &Device) -> Result<Self> {
         let shape = src.shape();
         let block_size = dtype.block_size();
         check_shape(shape, block_size)?;
@@ -393,11 +407,27 @@ impl QTensor {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum QMatMul {
-    QTensor(std::sync::Arc<QTensor>),
-    Tensor(Tensor),
-    TensorF16(Tensor),
+    /// Quantized tensor + cached GPU F16 copy. Mutex allows dropping Q4 bytes
+    /// from RAM after the first dequant (saves ~2.5GB for 4B models).
+    QTensor(std::sync::Mutex<Option<std::sync::Arc<QTensor>>>, std::sync::OnceLock<Tensor>),
+    /// CPU weight + cached GPU copy (OnceLock: upload once, reuse forever)
+    Tensor(Tensor, std::sync::OnceLock<Tensor>),
+    TensorF16(Tensor, std::sync::OnceLock<Tensor>),
+}
+
+impl Clone for QMatMul {
+    fn clone(&self) -> Self {
+        match self {
+            Self::QTensor(t, _) => {
+                let guard = t.lock().unwrap();
+                Self::QTensor(std::sync::Mutex::new(guard.clone()), std::sync::OnceLock::new())
+            }
+            Self::Tensor(w, _) => Self::Tensor(w.clone(), std::sync::OnceLock::new()),
+            Self::TensorF16(w, _) => Self::TensorF16(w.clone(), std::sync::OnceLock::new()),
+        }
+    }
 }
 
 thread_local! {
@@ -430,12 +460,12 @@ impl QMatMul {
         };
         let t = if dequantize {
             let tensor = qtensor.dequantize(&qtensor.device())?;
-            Self::Tensor(tensor)
+            Self::Tensor(tensor, std::sync::OnceLock::new())
         } else if DEQUANTIZE_ALL_F16.with(|b| *b) {
             let tensor = qtensor.dequantize_f16(&qtensor.device())?;
-            Self::TensorF16(tensor)
+            Self::TensorF16(tensor, std::sync::OnceLock::new())
         } else {
-            Self::QTensor(qtensor)
+            Self::QTensor(std::sync::Mutex::new(Some(qtensor)), std::sync::OnceLock::new())
         };
         Ok(t)
     }
@@ -446,9 +476,12 @@ impl QMatMul {
 
     pub fn dequantize_f16(&self) -> Result<Tensor> {
         match self {
-            Self::QTensor(t) => t.dequantize_f16(&t.device()),
-            Self::Tensor(t) => t.to_dtype(DType::F16),
-            Self::TensorF16(t) => Ok(t.clone()),
+            Self::QTensor(t, _) => {
+                let guard = t.lock().unwrap();
+                guard.as_ref().expect("QTensor already consumed").dequantize_f16(&crate::Device::Cpu)
+            }
+            Self::Tensor(t, _) => t.to_dtype(DType::F16),
+            Self::TensorF16(t, _) => Ok(t.clone()),
         }
     }
 
@@ -530,23 +563,75 @@ impl crate::CustomOp1 for QTensor {
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
-            Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
-            Self::Tensor(w) => {
+            Self::QTensor(t, cache) => {
+                if !xs.device().is_cpu() {
+                    // GPU path: lazy dequant Q4→F16 on CPU, upload to GPU, cache forever.
+                    let in_dtype = xs.dtype();
+                    let gpu_w = cache.get_or_init(|| {
+                        let guard = t.lock().unwrap();
+                        let qt = guard.as_ref().expect("QTensor already consumed");
+                        #[cfg(feature = "rocm")]
+                        {
+                            // Try GPU dequant first (Q4_0/Q8_0), fall back to CPU
+                            let raw = qt.data().expect("QTensor data");
+                            let elem_count = qt.shape().elem_count();
+                            let dtype = qt.dtype();
+                            if let Ok(w) = gpu_dequant::dequant_to_gpu(&raw, dtype, elem_count, xs.device()) {
+                                return w;
+                            }
+                        }
+                        // CPU fallback: dequant on CPU, upload to GPU
+                        let w = qt.dequantize_f16(&crate::Device::Cpu).unwrap();
+                        let w = w.t().unwrap().contiguous().unwrap();
+                        w.to_device(xs.device()).unwrap()
+                    });
+                    // Drop Q4 bytes from RAM after successful cache (saves ~2.5GB)
+                    {
+                        let mut guard = t.lock().unwrap();
+                        if guard.is_some() {
+                            *guard = None;
+                        }
+                    }
+                    // broadcast_left for batch dims (stays on GPU)
+                    let gpu_w = match *xs.dims() {
+                        [b1, b2, _, _] => gpu_w.broadcast_left((b1, b2))?,
+                        [bsize, _, _] => gpu_w.broadcast_left(bsize)?,
+                        _ => gpu_w.clone(),
+                    };
+                    xs.to_dtype(DType::F16)?.matmul(&gpu_w)?.to_dtype(in_dtype)
+                } else {
+                    let guard = t.lock().unwrap();
+                    let qt = guard.as_ref().expect("QTensor already consumed");
+                    xs.apply_op1_no_bwd(qt.as_ref())
+                }
+            }
+            Self::Tensor(w, cache) => {
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
                     [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
                     _ => w.t()?,
                 };
-                xs.matmul(&w)
+                // Cache GPU weight — upload once, reuse forever
+                if !xs.device().is_cpu() && w.device().is_cpu() {
+                    let gpu_w = cache.get_or_init(|| w.to_device(xs.device()).unwrap());
+                    xs.matmul(gpu_w)
+                } else {
+                    xs.matmul(&w)
+                }
             }
-            Self::TensorF16(w) => {
+            Self::TensorF16(w, cache) => {
                 let in_dtype = xs.dtype();
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
                     [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
                     _ => w.t()?,
                 };
-                xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
+                if !xs.device().is_cpu() && w.device().is_cpu() {
+                    let gpu_w = cache.get_or_init(|| w.to_device(xs.device()).unwrap());
+                    xs.to_dtype(DType::F16)?.matmul(gpu_w)?.to_dtype(in_dtype)
+                } else {
+                    xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
+                }
             }
         }
     }

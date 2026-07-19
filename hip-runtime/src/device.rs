@@ -51,4 +51,15 @@ impl HipDevice {
         let prop = unsafe { prop.assume_init() };
         Ok(prop.total_global_mem)
     }
+
+    /// Returns `(free_bytes, total_bytes)` for this device.
+    /// Uses `hipMemGetInfo` for live VRAM availability (not just the static
+    /// property from `hipGetDeviceProperties`).
+    pub fn mem_info(&self) -> Result<(usize, usize)> {
+        self.set_current()?;
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        check_hip(unsafe { hip_runtime::hipMemGetInfo(&mut free, &mut total) })?;
+        Ok((free, total))
+    }
 }

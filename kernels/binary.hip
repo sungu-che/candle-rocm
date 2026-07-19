@@ -1,5 +1,4 @@
 #include "hip_utils.h"
-#include <math.h>
 
 // Binary op: out[i] = lhs[lhs_i] OP rhs[rhs_i]
 // info layout when non-null: [dims..., lhs_strides..., rhs_strides...]
@@ -60,8 +59,8 @@ BINARY_OP(badd_f32, a + b)
 BINARY_OP(bsub_f32, a - b)
 BINARY_OP(bmul_f32, a * b)
 BINARY_OP(bdiv_f32, a / b)
-BINARY_OP(bmax_f32, fmaxf(a, b))
-BINARY_OP(bmin_f32, fminf(a, b))
+BINARY_OP(bmaximum_f32, (a > b ? a : b))
+BINARY_OP(bminimum_f32, (a < b ? a : b))
 
 CMP_OP(eq_f32, a == b)
 CMP_OP(ne_f32, a != b)

@@ -1,5 +1,4 @@
 #include "hip_utils.h"
-#include <math.h>
 
 // Unary op macro: out[i] = OP(inp[strided_i])
 #define UNARY_OP(NAME, EXPR)                                                     \
@@ -58,7 +57,7 @@ UNARY_OP(uceil_f32, ceilf(x))
 UNARY_OP(uround_f32, roundf(x))
 
 // Activations
-UNARY_OP(urelu_f32, fmaxf(x, 0.0f))
+UNARY_OP(urelu_f32, (x > 0.0f ? x : 0.0f))
 UNARY_OP(usilu_f32, x / (1.0f + expf(-x)))
 // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 UNARY_OP(ugelu_f32, 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x))))

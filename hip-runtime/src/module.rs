@@ -57,6 +57,9 @@ impl HipModule {
     }
 }
 
+unsafe impl Send for HipModule {}
+unsafe impl Sync for HipModule {}
+
 impl Drop for HipModule {
     fn drop(&mut self) {
         unsafe { hip_runtime::hipModuleUnload(self.module) };
@@ -65,10 +68,22 @@ impl Drop for HipModule {
 
 /// Compile a .hip source file to .hsaco using hipcc.
 pub fn compile_kernel(src: &Path, out: &Path, arch: &str) -> Result<()> {
-    let status = std::process::Command::new("/opt/rocm/bin/hipcc")
+    // Find hipcc: prefer /opt/rocm/bin (upstream), fall back to PATH (Ubuntu apt)
+    let hipcc = if std::path::Path::new("/opt/rocm/bin/hipcc").exists() {
+        "/opt/rocm/bin/hipcc"
+    } else {
+        "hipcc"
+    };
+    // On Ubuntu-packaged ROCm, the system math.h declares host-only functions
+    // that conflict with HIP device math intrinsics. Use --rocm-path and
+    // include the HIP wrapper to get proper device-side declarations.
+    let status = std::process::Command::new(hipcc)
         .args([
             "--genco",
             &format!("--offload-arch={arch}"),
+            "-O3",
+            "--cuda-device-only",
+            "-include", "hip/hip_runtime.h",
             "-o",
             out.to_str().unwrap(),
             src.to_str().unwrap(),

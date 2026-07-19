@@ -1,5 +1,4 @@
 #include "hip_utils.h"
-#include <math.h>
 #include <float.h>
 
 // Reduction kernels: one block per output element.
@@ -66,13 +65,13 @@ extern "C" __global__ void fast_max_f32(
     for (size_t r = tid; r < reduce_size; r += blockDim.x) {
         size_t flat = out_idx * reduce_size + r;
         size_t src_i = get_strided_index(flat, num_dims, dims, strides);
-        val = fmaxf(val, inp[src_i]);
+        val = (val > inp[src_i] ? val : inp[src_i]);
     }
     shr[tid] = val;
     __syncthreads();
 
     for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) shr[tid] = fmaxf(shr[tid], shr[tid + s]);
+        if (tid < s) shr[tid] = (shr[tid] > shr[tid + s] ? shr[tid] : shr[tid + s]);
         __syncthreads();
     }
     if (tid == 0) out[out_idx] = shr[0];
@@ -98,13 +97,13 @@ extern "C" __global__ void fast_min_f32(
     for (size_t r = tid; r < reduce_size; r += blockDim.x) {
         size_t flat = out_idx * reduce_size + r;
         size_t src_i = get_strided_index(flat, num_dims, dims, strides);
-        val = fminf(val, inp[src_i]);
+        val = (val < inp[src_i] ? val : inp[src_i]);
     }
     shr[tid] = val;
     __syncthreads();
 
     for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) shr[tid] = fminf(shr[tid], shr[tid + s]);
+        if (tid < s) shr[tid] = (shr[tid] < shr[tid + s] ? shr[tid] : shr[tid + s]);
         __syncthreads();
     }
     if (tid == 0) out[out_idx] = shr[0];

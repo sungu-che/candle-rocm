@@ -37,6 +37,15 @@ pub fn total_vram(ordinal: usize) -> Result<usize> {
         .map_err(|e| candle_core::Error::Msg(format!("{e}")))
 }
 
+/// Returns `(free_bytes, total_bytes)` for the given GPU.
+/// Uses `hipMemGetInfo` for live VRAM availability.
+pub fn mem_info(ordinal: usize) -> Result<(usize, usize)> {
+    let d = hip_runtime::device::HipDevice::new(ordinal)
+        .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+    d.mem_info()
+        .map_err(|e| candle_core::Error::Msg(format!("{e}")))
+}
+
 /// Returns true if at least one ROCm device is available.
 pub fn is_available() -> bool {
     device_count().map(|c| c > 0).unwrap_or(false)

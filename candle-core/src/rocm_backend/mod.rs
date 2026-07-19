@@ -1,6 +1,7 @@
 use crate::backend::BackendStorage;
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, DType, Layout, Result, Shape};
+use float8::F8E4M3;
 use hip_runtime::blas::RocBlas;
 use hip_runtime::device::HipDevice;
 use hip_runtime::memory::DeviceBuffer;
@@ -10,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 mod storage;
+#[cfg(feature = "rocm")]
+pub mod gpu_fp8gemm;
 
 /// A ROCm GPU device.
 #[derive(Clone, Debug)]
@@ -39,10 +42,15 @@ impl std::fmt::Debug for RocmDeviceInner {
 
 /// GPU-resident tensor storage.
 pub struct RocmStorage {
-    buf: DeviceBuffer<u8>,
-    dtype: DType,
-    device: RocmDevice,
+    pub(crate) buf: DeviceBuffer<u8>,
+    pub(crate) dtype: DType,
+    pub(crate) device: RocmDevice,
 }
+
+// Safety: ROCm device memory is managed by the HIP runtime.
+// DeviceBuffer holds a raw pointer but owns the allocation.
+unsafe impl Send for RocmStorage {}
+unsafe impl Sync for RocmStorage {}
 
 impl std::fmt::Debug for RocmStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -66,6 +74,16 @@ impl RocmStorage {
     pub fn elem_count(&self) -> usize {
         self.buf.byte_size() / self.dtype.size_in_bytes()
     }
+
+    /// Replace GPU buffer contents from a CpuStorage (same dtype required).
+    /// Used by inplace custom ops CPU fallback.
+    pub fn replace_from_cpu_storage(&mut self, cpu: &CpuStorage) -> Result<()> {
+        let (bytes, _dtype) = cpu_storage_to_bytes(cpu.clone());
+        let new_buf = DeviceBuffer::from_slice(&bytes)
+            .map_err(|e| crate::Error::Msg(format!("upload failed: {e}")))?;
+        self.buf = new_buf;
+        Ok(())
+    }
 }
 
 fn dtype_suffix(dtype: DType) -> &'static str {
@@ -75,8 +93,15 @@ fn dtype_suffix(dtype: DType) -> &'static str {
         DType::U8 => "u8",
         DType::U32 => "u32",
         DType::I64 => "i64",
+        DType::I16 => "i16",
+        DType::I32 => "i32",
         DType::F16 => "f16",
         DType::BF16 => "bf16",
+        DType::F8E4M3 => "f8e4m3",
+        DType::F6E2M3 => "f6e2m3",
+        DType::F6E3M2 => "f6e3m2",
+        DType::F4 => "f4",
+        DType::F8E8M0 => "f8e8m0",
     }
 }
 
@@ -98,7 +123,7 @@ impl RocmDevice {
         Ok(())
     }
 
-    fn with_module<F, R>(&self, kernel_file: &str, f: F) -> Result<R>
+    pub(crate) fn with_module<F, R>(&self, kernel_file: &str, f: F) -> Result<R>
     where
         F: FnOnce(&mut HipModule, &RocBlas) -> Result<R>,
     {
@@ -119,6 +144,25 @@ impl RocmDevice {
         f(&inner.blas)
     }
 
+    /// Returns `(free_bytes, total_bytes)` for this device.
+    /// Uses `hipMemGetInfo` for live VRAM availability.
+    pub fn mem_info(&self) -> Result<(usize, usize)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            ._device
+            .mem_info()
+            .map_err(|e| crate::Error::Msg(format!("mem_info failed: {e}")))
+    }
+
+    /// Returns the GPU device name (e.g. "AMD Radeon RX 6900 XT").
+    pub fn gpu_name(&self) -> Result<String> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            ._device
+            .name()
+            .map_err(|e| crate::Error::Msg(format!("device name failed: {e}")))
+    }
+
     fn alloc_buf(&self, byte_size: usize) -> Result<DeviceBuffer<u8>> {
         DeviceBuffer::<u8>::alloc(byte_size)
             .map_err(|e| crate::Error::Msg(format!("GPU alloc failed: {e}")))
@@ -127,6 +171,23 @@ impl RocmDevice {
     fn alloc_zeros_buf(&self, byte_size: usize) -> Result<DeviceBuffer<u8>> {
         DeviceBuffer::<u8>::alloc_zeros(byte_size)
             .map_err(|e| crate::Error::Msg(format!("GPU alloc_zeros failed: {e}")))
+    }
+
+    /// Direct upload of a raw byte slice (e.g. from an mmap'd safetensors
+    /// tensor view) to a GPU buffer, skipping the `CpuStorage` and
+    /// `cpu_storage_to_bytes` intermediates.
+    ///
+    /// `bytes` must already be in the correct on-device layout (little-endian,
+    /// matching `dtype`). The caller is responsible for ensuring alignment;
+    /// safetensors tensor data is naturally aligned.
+    pub(crate) fn storage_from_bytes(&self, bytes: &[u8], dtype: DType) -> Result<RocmStorage> {
+        let buf = DeviceBuffer::<u8>::from_host_bytes(bytes)
+            .map_err(|e| crate::Error::Msg(format!("GPU from_host_bytes failed: {e}")))?;
+        Ok(RocmStorage {
+            buf,
+            dtype,
+            device: self.clone(),
+        })
     }
 
     fn upload_info(&self, layout: &Layout) -> Result<Option<DeviceBuffer<usize>>> {
@@ -175,7 +236,7 @@ impl crate::backend::BackendDevice for RocmDevice {
                 Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../kernels")
             });
-        let arch = std::env::var("HIP_ARCH").unwrap_or_else(|_| "gfx1010".to_string());
+        let arch = std::env::var("HIP_ARCH").unwrap_or_else(|_| "gfx1030".to_string());
 
         Ok(Self {
             ordinal,
@@ -209,48 +270,6 @@ impl crate::backend::BackendDevice for RocmDevice {
             dtype,
             device: self.clone(),
         })
-    }
-
-    fn ones_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
-        match dtype {
-            DType::F32 => {
-                let numel = shape.elem_count();
-                let byte_size = numel * 4;
-                let buf = self.alloc_buf(byte_size)?;
-                let storage = RocmStorage {
-                    buf,
-                    dtype,
-                    device: self.clone(),
-                };
-                // Use affine: 0*x + 1 = 1 for all elements, but we need an input.
-                // Simpler: use fill kernel
-                let result = self.with_module("fill", |module, _blas| {
-                    let func = module
-                        .get_function("fill_f32")
-                        .map_err(|e| crate::Error::Msg(format!("{e}")))?;
-                    let (grid, block) = launch_cfg(numel);
-                    let mut out_ptr = storage.buf.as_ptr() as *mut f32;
-                    let val: f32 = 1.0;
-                    unsafe {
-                        let mut params: Vec<*mut std::ffi::c_void> = vec![
-                            &mut out_ptr as *mut _ as *mut std::ffi::c_void,
-                            &numel as *const _ as *mut std::ffi::c_void,
-                            &val as *const _ as *mut std::ffi::c_void,
-                        ];
-                        HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
-                            .map_err(|e| crate::Error::Msg(format!("{e}")))?;
-                    }
-                    Ok(())
-                });
-                result?;
-                Ok(storage)
-            }
-            _ => {
-                // Fall back to creating on CPU and uploading
-                let cpu_storage = crate::cpu_backend::CpuDevice.ones_impl(shape, dtype)?;
-                self.storage_from_cpu_storage(&cpu_storage)
-            }
-        }
     }
 
     unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
@@ -299,6 +318,11 @@ impl crate::backend::BackendDevice for RocmDevice {
         inner.rng_seed = seed;
         inner.rng_offset = 0;
         Ok(())
+    }
+
+    fn get_current_seed(&self) -> Result<u64> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.rng_seed)
     }
 
     fn synchronize(&self) -> Result<()> {
@@ -355,6 +379,34 @@ fn cpu_storage_to_bytes(storage: CpuStorage) -> (Vec<u8>, DType) {
                 .collect();
             (bytes, DType::F64)
         }
+        CpuStorage::I16(v) => {
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            (bytes, DType::I16)
+        }
+        CpuStorage::I32(v) => {
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            (bytes, DType::I32)
+        }
+        CpuStorage::F8E4M3(v) => {
+            let bytes: Vec<u8> = v.iter().map(|x| { let b: u8 = unsafe { std::mem::transmute(*x) }; b }).collect();
+            (bytes, DType::F8E4M3)
+        }
+        CpuStorage::F6E2M3(v) => {
+            let bytes: Vec<u8> = v.iter().map(|x| { let b: u8 = unsafe { std::mem::transmute(*x) }; b }).collect();
+            (bytes, DType::F6E2M3)
+        }
+        CpuStorage::F6E3M2(v) => {
+            let bytes: Vec<u8> = v.iter().map(|x| { let b: u8 = unsafe { std::mem::transmute(*x) }; b }).collect();
+            (bytes, DType::F6E3M2)
+        }
+        CpuStorage::F4(v) => {
+            let bytes: Vec<u8> = v.iter().map(|x| { let b: u8 = unsafe { std::mem::transmute(*x) }; b }).collect();
+            (bytes, DType::F4)
+        }
+        CpuStorage::F8E8M0(v) => {
+            let bytes: Vec<u8> = v.iter().map(|x| { let b: u8 = unsafe { std::mem::transmute(*x) }; b }).collect();
+            (bytes, DType::F8E8M0)
+        }
     }
 }
 
@@ -403,5 +455,17 @@ fn bytes_to_cpu_storage(bytes: &[u8], dtype: DType) -> CpuStorage {
                 .collect();
             CpuStorage::F64(v)
         }
+        DType::F8E4M3 => {
+            // F8E4M3 is a 1-byte float; CpuStorage stores it as Vec<F8E4M3>.
+            // The `float8::F8E4M3` type is `#[repr(transparent)]` over `u8`,
+            // so a byte slice is bit-identical to a `&[F8E4M3]`.
+            let v: Vec<float8::F8E4M3> = bytes
+                .iter()
+                .map(|b| unsafe { std::mem::transmute::<u8, float8::F8E4M3>(*b) })
+                .collect();
+            CpuStorage::F8E4M3(v)
+        }
+        DType::F8E8M0 => CpuStorage::F8E8M0(bytes.to_vec()),
+        _ => panic!("unsupported dtype for bytes_to_cpu_storage: {dtype:?}"),
     }
 }

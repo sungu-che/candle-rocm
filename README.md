@@ -7,7 +7,7 @@ ROCm/HIP backend for the [candle](https://github.com/huggingface/candle) ML fram
 - AMD GPU with ROCm support
 - ROCm 5.x+ with HIP runtime and rocBLAS
 - `hipcc` on PATH (for kernel compilation)
-- Set `HIP_ARCH` to your GPU architecture (e.g. `gfx1010` for RX 5700 XT, `gfx1100` for RX 7900 XTX)
+- Set `HIP_ARCH` to your GPU architecture (e.g. `gfx1010` for RX 5700 XT, `gfx1030` for RX 6900 XT, `gfx1100` for RX 7900 XTX)
 
 ## Usage
 
@@ -15,7 +15,7 @@ ROCm/HIP backend for the [candle](https://github.com/huggingface/candle) ML fram
 
 ```toml
 [dependencies]
-candle-rocm = { git = "https://github.com/Nu11ified/candle-rocm" }
+candle-rocm = { git = "https://github.com/vuongthai91/candle-rocm" }
 ```
 
 ```rust
@@ -35,7 +35,7 @@ fn main() -> candle_rocm::Result<()> {
 
 ```toml
 [dependencies]
-candle-core = { git = "https://github.com/Nu11ified/candle-rocm", features = ["rocm"] }
+candle-core = { git = "https://github.com/vuongthai91/candle-rocm", features = ["rocm"] }
 ```
 
 ```rust

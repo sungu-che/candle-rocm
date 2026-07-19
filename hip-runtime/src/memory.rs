@@ -84,6 +84,30 @@ impl<T: Copy> DeviceBuffer<T> {
     }
 }
 
+/// Specialised methods for byte buffers (`DeviceBuffer<u8>`).
+impl DeviceBuffer<u8> {
+    /// Allocate `bytes.len()` bytes of GPU memory and copy the host
+    /// data directly — no intermediate `Vec` or type cast.
+    ///
+    /// This is the fast path for uploading mmap'd safetensors weight
+    /// slices to the GPU: the `&[u8]` comes straight from the mmap
+    /// region and lands in VRAM in a single `hipMemcpy`.
+    pub fn from_host_bytes(bytes: &[u8]) -> Result<Self> {
+        let buf = Self::alloc(bytes.len())?;
+        if !bytes.is_empty() {
+            check_hip(unsafe {
+                hip_runtime::hipMemcpy(
+                    buf.ptr,
+                    bytes.as_ptr() as *const _,
+                    bytes.len(),
+                    hipMemcpyKind::hipMemcpyHostToDevice,
+                )
+            })?;
+        }
+        Ok(buf)
+    }
+}
+
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
@@ -93,3 +117,4 @@ impl<T> Drop for DeviceBuffer<T> {
 }
 
 unsafe impl<T: Send> Send for DeviceBuffer<T> {}
+unsafe impl<T: Send + Sync> Sync for DeviceBuffer<T> {}

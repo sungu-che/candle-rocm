@@ -7,5 +7,5 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Nu11ified/candle-rocm"
 
 [dependencies]
-candle-core = { path = "../candle-core", features = ["rocm"] }
+candle-core = { package = "candle-core-mold", path = "../candle-core", features = ["rocm"] }
 hip-runtime = { path = "../hip-runtime" }

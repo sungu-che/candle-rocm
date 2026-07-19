@@ -10,6 +10,229 @@ macro_rules! err {
 }
 
 impl RocmStorage {
+    /// Fast path: dispatch known CustomOp1 ops to GPU kernels.
+    /// Returns Ok(Some(result)) if dispatched, Ok(None) to fall back to CPU.
+    pub(crate) fn custom_op1_gpu(
+        &self,
+        layout: &Layout,
+        op_name: &str,
+    ) -> Result<Option<Self>> {
+        match op_name {
+            "softmax-last-dim" => {
+                if self.dtype != DType::F32 || !layout.is_contiguous() {
+                    return Ok(None);
+                }
+                let dims = layout.dims();
+                let last_dim = dims[dims.len() - 1];
+                let nrows = layout.shape().elem_count() / last_dim;
+                let ncols = last_dim;
+
+                let out_buf = self.device.alloc_buf(layout.shape().elem_count() * 4)?;
+                let inp_ptr = unsafe {
+                    (self.buf.as_ptr() as *const f32).add(layout.start_offset())
+                };
+                let out_ptr = out_buf.as_mut_ptr() as *mut f32;
+                let nrows_u = nrows as usize;
+                let ncols_u = ncols as usize;
+
+                self.device.with_module("softmax", |module, _| {
+                    let func = module
+                        .get_function("softmax_f32")
+                        .map_err(|e| err!("{e}"))?;
+                    let block = 256u32;
+                    let grid = nrows as u32;
+                    let shared_mem = (block * 4) as u32;
+                    unsafe {
+                        let mut p: Vec<*mut std::ffi::c_void> = vec![
+                            &inp_ptr as *const _ as *mut _,
+                            &out_ptr as *const _ as *mut _,
+                            &nrows_u as *const _ as *mut _,
+                            &ncols_u as *const _ as *mut _,
+                        ];
+                        HipModule::launch(
+                            func,
+                            (grid, 1, 1),
+                            (block, 1, 1),
+                            shared_mem,
+                            &mut p,
+                        )
+                        .map_err(|e| err!("softmax kernel: {e}"))?;
+                    }
+                    Ok(())
+                })?;
+
+                Ok(Some(RocmStorage {
+                    buf: out_buf,
+                    dtype: DType::F32,
+                    device: self.device.clone(),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Fast path: dispatch known CustomOp2 ops to GPU kernels.
+    /// Returns Ok(Some(result)) if dispatched, Ok(None) to fall back to CPU.
+    pub(crate) fn custom_op2_gpu(
+        &self,
+        layout: &Layout,
+        op_name: &str,
+        rhs: &Self,
+        rhs_l: &Layout,
+    ) -> Result<Option<Self>> {
+        match op_name {
+            "rms-norm" => {
+                // RMSNorm: y = x * rsqrt(mean(x²) + eps) * weight
+                // self = input (n_rows, n_cols), rhs = weight (n_cols,)
+                if !layout.is_contiguous() || !rhs_l.is_contiguous() {
+                    return Ok(None);
+                }
+                let dims = layout.dims();
+                if dims.len() < 2 {
+                    return Ok(None);
+                }
+                let n_cols = dims[dims.len() - 1];
+                let n_rows = layout.shape().elem_count() / n_cols;
+                let block_size: i32 = if n_cols < 1024 { 32 } else { 1024 };
+                let n_cols_i = n_cols as i32;
+                let eps: f32 = 1e-6; // default eps for candle-nn RmsNorm
+
+                // Dispatch to correct kernel based on dtype
+                match (self.dtype, rhs.dtype) {
+                    (DType::F32, DType::F32) => {
+                        // F32 path: weights are F32, input/output F32
+                        let out_buf = self.device.alloc_buf(layout.shape().elem_count() * 4)?;
+                        let inp_ptr = unsafe {
+                            (self.buf.as_ptr() as *const f32).add(layout.start_offset())
+                        };
+                        let out_ptr = out_buf.as_mut_ptr() as *mut f32;
+                        let w_ptr = unsafe {
+                            (rhs.buf.as_ptr() as *const f32).add(rhs_l.start_offset())
+                        };
+
+                        self.device.with_module("norm", |module, _| {
+                            let func = module
+                                .get_function("rmsnorm_f32")
+                                .map_err(|e| err!("{e}"))?;
+                            unsafe {
+                                let mut p: Vec<*mut std::ffi::c_void> = vec![
+                                    &inp_ptr as *const _ as *mut _,
+                                    &out_ptr as *const _ as *mut _,
+                                    &w_ptr as *const _ as *mut _,
+                                    &n_cols_i as *const _ as *mut _,
+                                    &block_size as *const _ as *mut _,
+                                    &eps as *const _ as *mut _,
+                                ];
+                                HipModule::launch(
+                                    func,
+                                    (n_rows as u32, 1, 1),
+                                    (block_size as u32, 1, 1),
+                                    0,
+                                    &mut p,
+                                )
+                                .map_err(|e| err!("rmsnorm_f32 kernel: {e}"))?;
+                            }
+                            Ok(())
+                        })?;
+
+                        Ok(Some(RocmStorage {
+                            buf: out_buf,
+                            dtype: DType::F32,
+                            device: self.device.clone(),
+                        }))
+                    }
+                    (DType::BF16, DType::F32) => {
+                        // BF16 path: input/output BF16, weights F32 (common for LLMs)
+                        // Kernel does F32 reduction internally, outputs BF16
+                        let out_buf = self.device.alloc_buf(layout.shape().elem_count() * 2)?;
+                        let inp_ptr = unsafe {
+                            (self.buf.as_ptr() as *const u16).add(layout.start_offset())
+                        };
+                        let out_ptr = out_buf.as_mut_ptr() as *mut u16;
+                        let w_ptr = unsafe {
+                            (rhs.buf.as_ptr() as *const f32).add(rhs_l.start_offset())
+                        };
+
+                        self.device.with_module("norm", |module, _| {
+                            let func = module
+                                .get_function("rmsnorm_bf16")
+                                .map_err(|e| err!("{e}"))?;
+                            unsafe {
+                                let mut p: Vec<*mut std::ffi::c_void> = vec![
+                                    &inp_ptr as *const _ as *mut _,
+                                    &out_ptr as *const _ as *mut _,
+                                    &w_ptr as *const _ as *mut _,
+                                    &n_cols_i as *const _ as *mut _,
+                                    &block_size as *const _ as *mut _,
+                                    &eps as *const _ as *mut _,
+                                ];
+                                HipModule::launch(
+                                    func,
+                                    (n_rows as u32, 1, 1),
+                                    (block_size as u32, 1, 1),
+                                    0,
+                                    &mut p,
+                                )
+                                .map_err(|e| err!("rmsnorm_bf16 kernel: {e}"))?;
+                            }
+                            Ok(())
+                        })?;
+
+                        Ok(Some(RocmStorage {
+                            buf: out_buf,
+                            dtype: DType::BF16,
+                            device: self.device.clone(),
+                        }))
+                    }
+                    (DType::F16, DType::F32) => {
+                        // F16 path: input/output F16, weights F32
+                        let out_buf = self.device.alloc_buf(layout.shape().elem_count() * 2)?;
+                        let inp_ptr = unsafe {
+                            (self.buf.as_ptr() as *const u16).add(layout.start_offset())
+                        };
+                        let out_ptr = out_buf.as_mut_ptr() as *mut u16;
+                        let w_ptr = unsafe {
+                            (rhs.buf.as_ptr() as *const f32).add(rhs_l.start_offset())
+                        };
+
+                        self.device.with_module("norm", |module, _| {
+                            let func = module
+                                .get_function("rmsnorm_f16")
+                                .map_err(|e| err!("{e}"))?;
+                            unsafe {
+                                let mut p: Vec<*mut std::ffi::c_void> = vec![
+                                    &inp_ptr as *const _ as *mut _,
+                                    &out_ptr as *const _ as *mut _,
+                                    &w_ptr as *const _ as *mut _,
+                                    &n_cols_i as *const _ as *mut _,
+                                    &block_size as *const _ as *mut _,
+                                    &eps as *const _ as *mut _,
+                                ];
+                                HipModule::launch(
+                                    func,
+                                    (n_rows as u32, 1, 1),
+                                    (block_size as u32, 1, 1),
+                                    0,
+                                    &mut p,
+                                )
+                                .map_err(|e| err!("rmsnorm_f16 kernel: {e}"))?;
+                            }
+                            Ok(())
+                        })?;
+
+                        Ok(Some(RocmStorage {
+                            buf: out_buf,
+                            dtype: DType::F16,
+                            device: self.device.clone(),
+                        }))
+                    }
+                    _ => Ok(None), // Fallback for unsupported dtype combinations
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn to_cpu(&self) -> Result<CpuStorage> {
         let bytes = self
             .buf
@@ -438,6 +661,9 @@ impl BackendStorage for RocmStorage {
             (DType::I64, DType::U32) => Some("cast_i64_u32"),
             (DType::U8, DType::U32) => Some("cast_u8_u32"),
             (DType::U32, DType::U8) => Some("cast_u32_u8"),
+            // F16↔F32 — attention bottleneck, keeps tensors on GPU
+            (DType::F16, DType::F32) => Some("cast_f16_f32"),
+            (DType::F32, DType::F16) => Some("cast_f32_f16"),
             _ => None,
         };
 
@@ -621,68 +847,234 @@ impl BackendStorage for RocmStorage {
 
     fn conv1d(
         &self,
-        _l: &Layout,
-        _kernel: &Self,
-        _kernel_l: &Layout,
-        _params: &crate::conv::ParamsConv1D,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        Err(err!("conv1d not supported on ROCm backend"))
+        // CPU fallback: download → conv1d on CPU → upload
+        let cpu_inp = self.to_cpu()?;
+        let cpu_ker = kernel.to_cpu()?;
+        let cpu_out = cpu_inp.conv1d(l, &cpu_ker, kernel_l, params)?;
+        self.device.storage_from_cpu_storage(&cpu_out)
     }
 
     fn conv_transpose1d(
         &self,
-        _l: &Layout,
-        _kernel: &Self,
-        _kernel_l: &Layout,
-        _params: &crate::conv::ParamsConvTranspose1D,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose1D,
     ) -> Result<Self> {
-        Err(err!("conv_transpose1d not supported on ROCm backend"))
+        let cpu_inp = self.to_cpu()?;
+        let cpu_ker = kernel.to_cpu()?;
+        let cpu_out = cpu_inp.conv_transpose1d(l, &cpu_ker, kernel_l, params)?;
+        self.device.storage_from_cpu_storage(&cpu_out)
     }
 
     fn conv2d(
         &self,
-        _l: &Layout,
-        _kernel: &Self,
-        _kernel_l: &Layout,
-        _params: &crate::conv::ParamsConv2D,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        Err(err!("conv2d not supported on ROCm backend"))
+        // GPU conv2d via im2col + rocBLAS GEMM
+        match self.dtype {
+            DType::F32 | DType::F16 => {}
+            _ => {
+                return self.cpu_fallback_binary(kernel, l, kernel_l, |sc, kc, sl, kl| {
+                    sc.conv2d(sl, kc, kl, params)
+                });
+            }
+        }
+        if self.dtype != kernel.dtype || !l.is_contiguous() || !kernel_l.is_contiguous() {
+            return self.cpu_fallback_binary(kernel, l, kernel_l, |sc, kc, sl, kl| {
+                sc.conv2d(sl, kc, kl, params)
+            });
+        }
+
+        let elem_size = self.dtype.size_in_bytes();
+        let c_in = params.c_in;
+        let c_out = params.c_out;
+        let k_h = params.k_h;
+        let k_w = params.k_w;
+        let i_h = params.i_h;
+        let i_w = params.i_w;
+        let b_size = params.b_size;
+        let padding = params.padding;
+        let stride = params.stride;
+        let dilation = 1usize;
+
+        let h_out = params.out_h();
+        let w_out = params.out_w();
+        let col_rows = c_in * k_h * k_w;       // im2col rows
+        let col_cols = b_size * h_out * w_out;  // im2col cols
+
+        // Allocate im2col buffer and output buffer on GPU
+        let im2col_bytes = col_rows * col_cols * elem_size;
+        // GPU atomic crash on RDNA2 with large repeated allocations — cap at 256MB
+        const IM2COL_LIMIT: usize = 128 * 1024 * 1024; // 128MB — RDNA2 atomic crash guard
+        if im2col_bytes > IM2COL_LIMIT {
+            return self.cpu_fallback_binary(kernel, l, kernel_l, |sc, kc, sl, kl| {
+                sc.conv2d(sl, kc, kl, params)
+            });
+        }
+
+        let im2col_buf = self.device.alloc_buf(im2col_bytes)?;
+        let out_buf = self.device.alloc_buf(c_out * col_cols * elem_size)?;
+
+        let input_ptr = unsafe {
+            (self.buf.as_ptr() as *const u8)
+                .add(l.start_offset() * elem_size) as *const std::ffi::c_void
+        };
+        let im2col_ptr = im2col_buf.as_void_ptr();
+        let weight_ptr = unsafe {
+            (kernel.buf.as_ptr() as *const u8)
+                .add(kernel_l.start_offset() * elem_size) as *const std::ffi::c_void
+        };
+        let out_ptr = out_buf.as_void_ptr();
+
+        let kernel_name = match self.dtype {
+            DType::F32 => "im2col_f32",
+            DType::F16 => "im2col_f16",
+            _ => unreachable!(),
+        };
+
+        self.device.with_module("conv2d", |module, blas| {
+            // Launch im2col kernel
+            let func = module.get_function(kernel_name).map_err(|e| err!("{e}"))?;
+            let total = b_size * h_out * w_out;
+            let (grid, block) = launch_cfg(total);
+
+            let b_i = b_size as i32;
+            let c_i = c_in as i32;
+            let ih_i = i_h as i32;
+            let iw_i = i_w as i32;
+            let kh_i = k_h as i32;
+            let kw_i = k_w as i32;
+            let pad_i = padding as i32;
+            let str_i = stride as i32;
+            let dil_i = dilation as i32;
+            let ho_i = h_out as i32;
+            let wo_i = w_out as i32;
+
+            unsafe {
+                let mut p: Vec<*mut std::ffi::c_void> = vec![
+                    &input_ptr as *const _ as *mut _,
+                    &im2col_ptr as *const _ as *mut _,
+                    &b_i as *const _ as *mut _, &c_i as *const _ as *mut _,
+                    &ih_i as *const _ as *mut _, &iw_i as *const _ as *mut _,
+                    &kh_i as *const _ as *mut _, &kw_i as *const _ as *mut _,
+                    &pad_i as *const _ as *mut _, &str_i as *const _ as *mut _,
+                    &dil_i as *const _ as *mut _,
+                    &ho_i as *const _ as *mut _, &wo_i as *const _ as *mut _,
+                ];
+                HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut p)
+                    .map_err(|e| err!("im2col failed: {e}"))?;
+            }
+
+            // GEMM: weight(C_out, col_rows) × im2col(col_rows, col_cols) = out(C_out, col_cols)
+            // Row-major: C[m,n] = A[m,k] * B[k,n]
+            // Col-major: gemm(N,N, n,m,k, 1.0, B,n, A,k, 0.0, C,n)
+            let m = c_out;
+            let k = col_rows;
+            let n = col_cols;
+
+            match self.dtype {
+                DType::F32 => {
+                    unsafe {
+                        blas.sgemm_raw(false, false, n, m, k, 1.0,
+                            im2col_ptr, n, weight_ptr, k, 0.0, out_ptr, n)
+                            .map_err(|e| err!("sgemm failed: {e}"))?;
+                    }
+                }
+                DType::F16 => {
+                    let alpha: u16 = 0x3C00; // f16 1.0
+                    let beta: u16 = 0x0000;  // f16 0.0
+                    unsafe {
+                        blas.hgemm_raw(false, false, n, m, k, alpha,
+                            im2col_ptr, n, weight_ptr, k, beta, out_ptr, n)
+                            .map_err(|e| err!("hgemm failed: {e}"))?;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            Ok(())
+        })?;
+
+        Ok(RocmStorage {
+            buf: out_buf,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
     }
 
     fn conv_transpose2d(
         &self,
-        _l: &Layout,
-        _kernel: &Self,
-        _kernel_l: &Layout,
-        _params: &crate::conv::ParamsConvTranspose2D,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
-        Err(err!("conv_transpose2d not supported on ROCm backend"))
+        let cpu_inp = self.to_cpu()?;
+        let cpu_ker = kernel.to_cpu()?;
+        let cpu_out = cpu_inp.conv_transpose2d(l, &cpu_ker, kernel_l, params)?;
+        self.device.storage_from_cpu_storage(&cpu_out)
     }
 
     fn avg_pool2d(
         &self,
-        _: &Layout,
-        _: (usize, usize),
-        _: (usize, usize),
+        l: &Layout,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
     ) -> Result<Self> {
-        Err(err!("avg_pool2d not supported on ROCm backend"))
+        let cpu_inp = self.to_cpu()?;
+        let cpu_out = cpu_inp.avg_pool2d(l, kernel_size, stride)?;
+        self.device.storage_from_cpu_storage(&cpu_out)
     }
 
     fn max_pool2d(
         &self,
-        _: &Layout,
-        _: (usize, usize),
-        _: (usize, usize),
+        l: &Layout,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
     ) -> Result<Self> {
-        Err(err!("max_pool2d not supported on ROCm backend"))
+        let cpu_inp = self.to_cpu()?;
+        let cpu_out = cpu_inp.max_pool2d(l, kernel_size, stride)?;
+        self.device.storage_from_cpu_storage(&cpu_out)
     }
 
-    fn upsample_nearest1d(&self, _: &Layout, _: usize) -> Result<Self> {
-        Err(err!("upsample_nearest1d not supported on ROCm backend"))
+    fn upsample_nearest1d(&self, l: &Layout, target_size: usize) -> Result<Self> {
+        let cpu_inp = self.to_cpu()?;
+        let cpu_out = cpu_inp.upsample_nearest1d(l, target_size)?;
+        self.device.storage_from_cpu_storage(&cpu_out)
     }
 
-    fn upsample_nearest2d(&self, _: &Layout, _: usize, _: usize) -> Result<Self> {
-        Err(err!("upsample_nearest2d not supported on ROCm backend"))
+    fn upsample_nearest2d(
+        &self,
+        l: &Layout,
+        target_h: usize,
+        target_w: usize,
+    ) -> Result<Self> {
+        let cpu_inp = self.to_cpu()?;
+        let cpu_out = cpu_inp.upsample_nearest2d(l, target_h, target_w)?;
+        self.device.storage_from_cpu_storage(&cpu_out)
+    }
+
+    fn upsample_bilinear2d(
+        &self,
+        l: &Layout,
+        target_h: usize,
+        target_w: usize,
+        align_corners: bool,
+        scales_h: Option<f64>,
+        scales_w: Option<f64>,
+    ) -> Result<Self> {
+        let cpu_inp = self.to_cpu()?;
+        let cpu_out =
+            cpu_inp.upsample_bilinear2d(l, target_h, target_w, align_corners, scales_h, scales_w)?;
+        self.device.storage_from_cpu_storage(&cpu_out)
     }
 
     fn gather(
@@ -745,69 +1137,46 @@ impl BackendStorage for RocmStorage {
         })
     }
 
-    fn scatter_add(
-        &self,
+    fn scatter_set(
+        &mut self,
         layout: &Layout,
         ids: &Self,
         ids_l: &Layout,
         src: &Self,
         src_l: &Layout,
         dim: usize,
-    ) -> Result<Self> {
-        if self.dtype != DType::F32
-            || !layout.is_contiguous()
-            || !ids_l.is_contiguous()
-            || !src_l.is_contiguous()
-        {
-            let cpu_self = self.to_cpu()?;
-            let cpu_ids = ids.to_cpu()?;
-            let cpu_src = src.to_cpu()?;
-            let result = cpu_self.scatter_add(layout, &cpu_ids, ids_l, &cpu_src, src_l, dim)?;
-            return self.device.storage_from_cpu_storage(&result);
-        }
+    ) -> Result<()> {
+        // CPU fallback: download, scatter on CPU, upload
+        let cpu_self = self.to_cpu()?;
+        let cpu_ids = ids.to_cpu()?;
+        let cpu_src = src.to_cpu()?;
+        let mut cpu_result = cpu_self.try_clone(layout)?;
+        cpu_result.scatter_set(layout, &cpu_ids, ids_l, &cpu_src, src_l, dim)?;
+        let new_buf = DeviceBuffer::from_slice(&super::cpu_storage_to_bytes(cpu_result).0)
+            .map_err(|e| err!("upload failed: {e}"))?;
+        self.buf = new_buf;
+        Ok(())
+    }
 
-        // Start with a copy of self, then scatter-add into it
-        let dst = self.try_clone(layout)?;
-        let src_dims = src_l.dims();
-        let left_size: usize = src_dims[..dim].iter().product();
-        let src_dim_size = src_dims[dim];
-        let dst_dim_size = layout.dims()[dim];
-        let right_size: usize = src_dims[dim + 1..].iter().product::<usize>().max(1);
-        let numel = src_l.shape().elem_count();
-
-        let kernel_name = match ids.dtype {
-            DType::U32 => "scatter_add_u32_f32",
-            DType::I64 => "scatter_add_i64_f32",
-            _ => return Err(err!("scatter_add: unsupported index type {:?}", ids.dtype)),
-        };
-
-        self.device.with_module("indexing", |module, _| {
-            let func = module.get_function(kernel_name).map_err(|e| err!("{e}"))?;
-            let (grid, block) = launch_cfg(numel);
-            let ids_ptr = unsafe {
-                (ids.buf.as_ptr()).add(ids_l.start_offset() * ids.dtype.size_in_bytes())
-            };
-            let src_ptr = unsafe {
-                (src.buf.as_ptr() as *const f32).add(src_l.start_offset())
-            };
-            let dst_ptr = dst.buf.as_mut_ptr() as *mut f32;
-            unsafe {
-                let mut params: Vec<*mut std::ffi::c_void> = vec![
-                    &numel as *const _ as *mut _,
-                    &ids_ptr as *const _ as *mut _,
-                    &src_ptr as *const _ as *mut _,
-                    &dst_ptr as *const _ as *mut _,
-                    &left_size as *const _ as *mut _,
-                    &src_dim_size as *const _ as *mut _,
-                    &dst_dim_size as *const _ as *mut _,
-                    &right_size as *const _ as *mut _,
-                ];
-                HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
-                    .map_err(|e| err!("{e}"))?;
-            }
-            Ok(())
-        })?;
-        Ok(dst)
+    fn scatter_add_set(
+        &mut self,
+        layout: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
+    ) -> Result<()> {
+        // CPU fallback: download, scatter-add on CPU, upload
+        let cpu_self = self.to_cpu()?;
+        let cpu_ids = ids.to_cpu()?;
+        let cpu_src = src.to_cpu()?;
+        let mut cpu_result = cpu_self.try_clone(layout)?;
+        cpu_result.scatter_add_set(layout, &cpu_ids, ids_l, &cpu_src, src_l, dim)?;
+        let new_buf = DeviceBuffer::from_slice(&super::cpu_storage_to_bytes(cpu_result).0)
+            .map_err(|e| err!("upload failed: {e}"))?;
+        self.buf = new_buf;
+        Ok(())
     }
 
     fn index_select(
@@ -941,7 +1310,17 @@ impl BackendStorage for RocmStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 {
+        // Only F32, F16, BF16 supported on GPU; others fall back to CPU.
+        match self.dtype {
+            DType::F32 | DType::F16 | DType::BF16 => {}
+            _ => {
+                return self.cpu_fallback_binary(rhs, lhs_l, rhs_l, |lc, rc, ll, rl| {
+                    lc.matmul(rc, (b, m, n, k), ll, rl)
+                });
+            }
+        }
+
+        if self.dtype != rhs.dtype {
             return self.cpu_fallback_binary(rhs, lhs_l, rhs_l, |lc, rc, ll, rl| {
                 lc.matmul(rc, (b, m, n, k), ll, rl)
             });
@@ -953,66 +1332,157 @@ impl BackendStorage for RocmStorage {
             });
         }
 
-        let out_byte_size = b * m * n * 4;
+        let elem_size = self.dtype.size_in_bytes();
+        let out_byte_size = b * m * n * elem_size;
         let out_buf = self.device.alloc_buf(out_byte_size)?;
 
         // Row-major A[m,k] * B[k,n] = C[m,n]
         // In col-major: C'[n,m] = B'[n,k] * A'[k,m]
-        // sgemm(N, N, n, m, k, 1.0, B, n, A, k, 0.0, C, n)
+        // gemm(N, N, n, m, k, 1.0, B, n, A, k, 0.0, C, n)
         let lhs_ptr = unsafe {
             (self.buf.as_ptr() as *const u8)
-                .add(lhs_l.start_offset() * 4) as *const std::ffi::c_void
+                .add(lhs_l.start_offset() * elem_size) as *const std::ffi::c_void
         };
         let rhs_ptr = unsafe {
             (rhs.buf.as_ptr() as *const u8)
-                .add(rhs_l.start_offset() * 4) as *const std::ffi::c_void
+                .add(rhs_l.start_offset() * elem_size) as *const std::ffi::c_void
         };
         let out_ptr = out_buf.as_void_ptr();
 
-        self.device.with_blas(|blas| {
-            if b == 1 {
-                unsafe {
-                    blas.sgemm_raw(
-                        false, false,
-                        n, m, k,
-                        1.0,
-                        rhs_ptr, n,
-                        lhs_ptr, k,
-                        0.0,
-                        out_ptr, n,
-                    )
-                    .map_err(|e| err!("sgemm failed: {e}"))?;
-                }
-            } else {
-                let stride_a = (k * n) as i64; // rhs batch stride
-                let stride_b = (m * k) as i64; // lhs batch stride
-                let stride_c = (m * n) as i64;
-                unsafe {
-                    blas.sgemm_strided_batched_raw(
-                        false, false,
-                        n, m, k,
-                        1.0,
-                        rhs_ptr, n, stride_a,
-                        lhs_ptr, k, stride_b,
-                        0.0,
-                        out_ptr, n, stride_c,
-                        b,
-                    )
-                    .map_err(|e| err!("sgemm_strided_batched failed: {e}"))?;
-                }
+        match self.dtype {
+            DType::F32 => {
+                self.device.with_blas(|blas| {
+                    if b == 1 {
+                        unsafe {
+                            blas.sgemm_raw(
+                                false, false,
+                                n, m, k,
+                                1.0,
+                                rhs_ptr, n,
+                                lhs_ptr, k,
+                                0.0,
+                                out_ptr, n,
+                            )
+                            .map_err(|e| err!("sgemm failed: {e}"))?;
+                        }
+                    } else {
+                        let stride_a = (k * n) as i64;
+                        let stride_b = (m * k) as i64;
+                        let stride_c = (m * n) as i64;
+                        unsafe {
+                            blas.sgemm_strided_batched_raw(
+                                false, false,
+                                n, m, k,
+                                1.0,
+                                rhs_ptr, n, stride_a,
+                                lhs_ptr, k, stride_b,
+                                0.0,
+                                out_ptr, n, stride_c,
+                                b,
+                            )
+                            .map_err(|e| err!("sgemm_strided_batched failed: {e}"))?;
+                        }
+                    }
+                    Ok(())
+                })?;
             }
-            Ok(())
-        })?;
+            DType::F16 => {
+                // Use rocblas_hgemm — native f16 GEMM on RDNA2+
+                // f16 ONE = 0x3C00, ZERO = 0x0000
+                let alpha: u16 = 0x3C00;
+                let beta: u16 = 0x0000;
+                self.device.with_blas(|blas| {
+                    if b == 1 {
+                        unsafe {
+                            blas.hgemm_raw(
+                                false, false,
+                                n, m, k,
+                                alpha,
+                                rhs_ptr, n,
+                                lhs_ptr, k,
+                                beta,
+                                out_ptr, n,
+                            )
+                            .map_err(|e| err!("hgemm failed: {e}"))?;
+                        }
+                    } else {
+                        let stride_a = (k * n) as i64;
+                        let stride_b = (m * k) as i64;
+                        let stride_c = (m * n) as i64;
+                        unsafe {
+                            blas.hgemm_strided_batched_raw(
+                                false, false,
+                                n, m, k,
+                                alpha,
+                                rhs_ptr, n, stride_a,
+                                lhs_ptr, k, stride_b,
+                                beta,
+                                out_ptr, n, stride_c,
+                                b,
+                            )
+                            .map_err(|e| err!("hgemm_strided_batched failed: {e}"))?;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            DType::BF16 => {
+                // Use rocblas_gemm_ex with BF16 I/O, F32 compute.
+                // This is the standard path for BF16 on ROCm.
+                use hip_sys::rocblas;
+                let alpha: f32 = 1.0;
+                let beta: f32 = 0.0;
+                let dt = rocblas::rocblas_datatype::rocblas_datatype_bf16_r;
+                let ct = rocblas::rocblas_compute_type::rocblas_compute_type_f32;
+                self.device.with_blas(|blas| {
+                    if b == 1 {
+                        unsafe {
+                            blas.gemm_ex_raw(
+                                false, false,
+                                n, m, k,
+                                &alpha as *const f32 as *const std::ffi::c_void,
+                                rhs_ptr, dt, n,
+                                lhs_ptr, dt, k,
+                                &beta as *const f32 as *const std::ffi::c_void,
+                                out_ptr, dt, n,
+                                ct,
+                            )
+                            .map_err(|e| err!("gemm_ex (bf16) failed: {e}"))?;
+                        }
+                    } else {
+                        let stride_a = (k * n) as i64;
+                        let stride_b = (m * k) as i64;
+                        let stride_c = (m * n) as i64;
+                        unsafe {
+                            blas.gemm_strided_batched_ex_raw(
+                                false, false,
+                                n, m, k,
+                                &alpha as *const f32 as *const std::ffi::c_void,
+                                rhs_ptr, dt, n, stride_a,
+                                lhs_ptr, dt, k, stride_b,
+                                &beta as *const f32 as *const std::ffi::c_void,
+                                out_ptr, dt, n, stride_c,
+                                b,
+                                ct,
+                            )
+                            .map_err(|e| err!("gemm_strided_batched_ex (bf16) failed: {e}"))?;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            _ => unreachable!(),
+        }
 
         Ok(RocmStorage {
             buf: out_buf,
-            dtype: DType::F32,
+            dtype: self.dtype,
             device: self.device.clone(),
         })
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, layout: &Layout) -> Result<()> {
-        if self.dtype != DType::F32 {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
             let cpu_self = self.to_cpu()?;
             let mut cpu_dst = dst.to_cpu()?;
             cpu_self.copy_strided_src(&mut cpu_dst, dst_offset, layout)?;
@@ -1023,12 +1493,13 @@ impl BackendStorage for RocmStorage {
             return Ok(());
         }
 
+        let elem_size = self.dtype.size_in_bytes();
         let numel = layout.shape().elem_count();
 
         if layout.is_contiguous() {
-            let src_offset = layout.start_offset() * 4;
-            let dst_byte_offset = dst_offset * 4;
-            let byte_size = numel * 4;
+            let src_offset = layout.start_offset() * elem_size;
+            let dst_byte_offset = dst_offset * elem_size;
+            let byte_size = numel * elem_size;
             unsafe {
                 hip_sys::hip_runtime::hipMemcpy(
                     (dst.buf.as_mut_ptr() as *mut u8).add(dst_byte_offset) as *mut _,
@@ -1041,15 +1512,20 @@ impl BackendStorage for RocmStorage {
             let info: Vec<usize> = [layout.dims(), layout.stride()].concat();
             let info_buf = DeviceBuffer::from_slice(&info)
                 .map_err(|e| err!("info upload failed: {e}"))?;
+            let kernel_name = match self.dtype {
+                DType::F32 => "copy_strided_f32",
+                DType::F16 => "copy_strided_f16",
+                _ => unreachable!(),
+            };
             self.device.with_module("fill", |module, _| {
                 let func = module
-                    .get_function("copy_strided_f32")
+                    .get_function(kernel_name)
                     .map_err(|e| err!("{e}"))?;
                 let (grid, block) = launch_cfg(numel);
                 let num_dims = layout.dims().len();
                 let info_ptr = info_buf.as_ptr();
-                let src_ptr = self.buf.as_ptr() as *const f32;
-                let dst_ptr = dst.buf.as_mut_ptr() as *mut f32;
+                let src_ptr = self.buf.as_ptr() as *const u8;
+                let dst_ptr = dst.buf.as_mut_ptr() as *mut u8;
                 let src_offset = layout.start_offset();
                 unsafe {
                     let mut params: Vec<*mut std::ffi::c_void> = vec![
@@ -1115,5 +1591,16 @@ impl BackendStorage for RocmStorage {
             }
             Ok(())
         })
+    }
+
+    fn const_set(&mut self, v: crate::scalar::Scalar, layout: &Layout) -> Result<()> {
+        // CPU fallback
+        let mut cpu_self = self.to_cpu()?;
+        cpu_self.const_set(v, layout)?;
+        let (bytes, _dtype) = super::cpu_storage_to_bytes(cpu_self);
+        let new_buf = DeviceBuffer::from_slice(&bytes)
+            .map_err(|e| err!("upload failed: {e}"))?;
+        self.buf = new_buf;
+        Ok(())
     }
 }

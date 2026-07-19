@@ -50,6 +50,24 @@ extern "C" __global__ void copy_strided_f32(
     }
 }
 
+// Copy strided source to contiguous destination (F16)
+extern "C" __global__ void copy_strided_f16(
+    const __half *src,
+    __half *dst,
+    const size_t numel,
+    const size_t num_dims,
+    const size_t *info,
+    const size_t src_offset,
+    const size_t dst_offset
+) {
+    const size_t *dims = info;
+    const size_t *strides = info + num_dims;
+    for (size_t i = GS_IDX; i < numel; i += GS_STEP) {
+        size_t src_i = get_strided_index(i, num_dims, dims, strides) + src_offset;
+        dst[i + dst_offset] = src[src_i];
+    }
+}
+
 // 2D copy with different src/dst strides (like cudaMemcpy2D)
 extern "C" __global__ void copy2d_f32(
     const float *src,
