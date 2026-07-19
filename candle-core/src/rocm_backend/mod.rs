@@ -1,7 +1,6 @@
 use crate::backend::BackendStorage;
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, DType, Layout, Result, Shape};
-use float8::F8E4M3;
 use hip_runtime::blas::RocBlas;
 use hip_runtime::device::HipDevice;
 use hip_runtime::memory::DeviceBuffer;

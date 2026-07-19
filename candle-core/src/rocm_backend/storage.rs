@@ -1430,11 +1430,13 @@ impl BackendStorage for RocmStorage {
                 // Use rocblas_gemm_ex with BF16 I/O, F32 compute.
                 // This is the standard path for BF16 on ROCm.
                 use hip_sys::rocblas;
-                let alpha: f32 = 1.0;
-                let beta: f32 = 0.0;
                 let dt = rocblas::rocblas_datatype::rocblas_datatype_bf16_r;
                 let ct = rocblas::rocblas_compute_type::rocblas_compute_type_f32;
                 self.device.with_blas(|blas| {
+                    // alpha/beta must be declared INSIDE the closure so the
+                    // pointer references remain valid for the FFI call lifetime.
+                    let alpha: f32 = 1.0;
+                    let beta: f32 = 0.0;
                     if b == 1 {
                         unsafe {
                             blas.gemm_ex_raw(
@@ -1594,7 +1596,11 @@ impl BackendStorage for RocmStorage {
     }
 
     fn const_set(&mut self, v: crate::scalar::Scalar, layout: &Layout) -> Result<()> {
-        // CPU fallback
+        // CPU fallback: download full tensor to CpuStorage, mutate there,
+        // re-upload. CpuStorage.const_set is defined on the CPU backend enum
+        // (not RocmStorage), so there is no recursion risk here.
+        // DeviceBuffer has Drop — assignment self.buf = new_buf frees the
+        // old GPU allocation via hipFree automatically.
         let mut cpu_self = self.to_cpu()?;
         cpu_self.const_set(v, layout)?;
         let (bytes, _dtype) = super::cpu_storage_to_bytes(cpu_self);

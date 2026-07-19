@@ -45,6 +45,10 @@ impl<T: Copy> DeviceBuffer<T> {
 
     /// Copy device buffer back to host.
     pub fn to_vec(&self) -> Result<Vec<T>> {
+        // SAFETY: `result` is zero-filled as a placeholder; hipMemcpy fully
+        // overwrites every element before the caller reads any of them.
+        // This pattern avoids the need to heap-allocate a typed buffer on
+        // the Rust side while still being safe.
         let mut result = vec![unsafe { std::mem::zeroed() }; self.len];
         let bytes = self.len * std::mem::size_of::<T>();
         check_hip(unsafe {
@@ -66,7 +70,9 @@ impl<T: Copy> DeviceBuffer<T> {
         self.ptr as *mut T
     }
 
-    /// Raw void pointer (for kernel params and rocBLAS).
+    /// Raw void pointer for kernel params and rocBLAS.
+    /// When the buffer is used as input to rocBLAS (which takes *const),
+    /// cast via `as_void_ptr() as *const c_void`.
     pub fn as_void_ptr(&self) -> *mut std::ffi::c_void {
         self.ptr
     }

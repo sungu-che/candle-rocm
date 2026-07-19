@@ -76,15 +76,18 @@ pub fn fp8_gemm_f16(
     let out_buf = DeviceBuffer::<u8>::alloc(out_bytes)
         .map_err(|e| crate::Error::Msg(format!("output alloc failed: {e}")))?;
 
-    // Get device pointers from ROCm storage
-    let w_ptr = {
+    // Extract device pointers BEFORE building param Vec.
+    // storage_and_layout() borrows storage from the tensor — the temporary
+    // borrow ends at this statement's semicolon. We must copy the raw
+    // pointers into owned locals BEFORE the temporary drops.
+    let w_ptr: *const u8 = {
         let (storage, _layout) = w_fp8.storage_and_layout();
         let Storage::Rocm(rs) = &*storage else {
             return Err(crate::Error::Msg("W must be on ROCm device".into()));
         };
         rs.buf.as_ptr() as *const u8
     };
-    let x_ptr = {
+    let x_ptr: *const u8 = {
         let (storage, _layout) = x.storage_and_layout();
         let Storage::Rocm(rs) = &*storage else {
             return Err(crate::Error::Msg("X must be on ROCm device".into()));
@@ -92,7 +95,7 @@ pub fn fp8_gemm_f16(
         rs.buf.as_ptr() as *const u8
     };
     let scale_ptr = scale_buf.as_ptr() as *const f32;
-    let out_ptr = out_buf.as_void_ptr() as *mut std::ffi::c_void;
+    let out_ptr = out_buf.as_mut_ptr() as *mut std::ffi::c_void;
 
     let m_i = m as i32;
     let n_i = n as i32;

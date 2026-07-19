@@ -24,9 +24,9 @@ extern "C" __global__ void dequant_q4_0_f16(
 
     // Each Q4_0 block: 2 bytes scale (f16) + 16 bytes quantized
     const uint8_t* block = input + block_idx * 18;
-    __half d;
-    // First 2 bytes = f16 scale
-    *reinterpret_cast<uint16_t*>(&d) = *reinterpret_cast<const uint16_t*>(block);
+    unsigned short d_bits;
+    memcpy(&d_bits, block, 2);
+    __half d = __half_raw(d_bits);
     const uint8_t* qs = block + 2;
 
     __half* out = output + block_idx * 32;
@@ -54,8 +54,9 @@ extern "C" __global__ void dequant_q8_0_f16(
 
     // Each Q8_0 block: 2 bytes scale (f16) + 32 bytes quantized
     const uint8_t* block = input + block_idx * 34;
-    __half d;
-    *reinterpret_cast<uint16_t*>(&d) = *reinterpret_cast<const uint16_t*>(block);
+    unsigned short d_bits;
+    memcpy(&d_bits, block, 2);
+    __half d = __half_raw(d_bits);
     const uint8_t* qs = block + 2;
 
     __half* out = output + block_idx * 32;
@@ -74,8 +75,9 @@ extern "C" __global__ void dequant_q4_0_f32(
     if (block_idx >= num_blocks) return;
 
     const uint8_t* block = input + block_idx * 18;
-    __half d_half;
-    *reinterpret_cast<uint16_t*>(&d_half) = *reinterpret_cast<const uint16_t*>(block);
+    unsigned short d_bits_half;
+    memcpy(&d_bits_half, block, 2);
+    __half d_half = __half_raw(d_bits_half);
     float d = __half2float(d_half);
     const uint8_t* qs = block + 2;
 
@@ -97,8 +99,9 @@ extern "C" __global__ void dequant_q8_0_f32(
     if (block_idx >= num_blocks) return;
 
     const uint8_t* block = input + block_idx * 34;
-    __half d_half;
-    *reinterpret_cast<uint16_t*>(&d_half) = *reinterpret_cast<const uint16_t*>(block);
+    unsigned short d_bits_half;
+    memcpy(&d_bits_half, block, 2);
+    __half d_half = __half_raw(d_bits_half);
     float d = __half2float(d_half);
     const uint8_t* qs = block + 2;
 
@@ -107,3 +110,4 @@ extern "C" __global__ void dequant_q8_0_f32(
         out[i] = (float)qs[i] * d;
     }
 }
+
