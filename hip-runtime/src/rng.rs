@@ -9,6 +9,7 @@ use crate::module::{compile_kernel, HipModule};
 use hip_sys::hip_runtime;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub struct HipRng {
     module: HipModule,
     seed: u64,

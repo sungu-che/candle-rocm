@@ -123,9 +123,110 @@ extern "C" __global__ void rmsnorm_bf16(
     }
 }
 
-// Fused F16 RMSNorm kernel: y = x * rsqrt(mean(x^2) + eps) * weight
-// Uses __half from hip_fp16.h
+// Fused BF16×BF16 RMSNorm kernel: y = x * rsqrt(mean(x^2) + eps) * weight
+// Input/output/weight all bfloat16. Computation in float32.
+// One block per row. Reduces to F32 for the sum, then normalizes.
+extern "C" __global__ void rmsnorm_bf16_bf16(
+    const __hip_bfloat16* __restrict__ input,   // (n_rows, n_cols)
+    __hip_bfloat16* __restrict__ output,        // (n_rows, n_cols)
+    const __hip_bfloat16* __restrict__ weight,   // (n_cols,) BF16
+    const int n_cols,
+    const int block_size,
+    const float eps
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const __hip_bfloat16* row_in = input + row * n_cols;
+    __hip_bfloat16* row_out = output + row * n_cols;
+
+    // Phase 1: compute sum of squares in F32
+    float local_sum = 0.0f;
+    for (int i = tid; i < n_cols; i += block_size) {
+        float v = __bfloat162float(row_in[i]);
+        local_sum += v * v;
+    }
+
+    // Warp-level reduce
+    __shared__ float shared[32];
+    float val = local_sum;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down(val, offset);
+    }
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    if (lane_id == 0) shared[warp_id] = val;
+    __syncthreads();
+
+    int num_warps = (block_size + 31) / 32;
+    if (tid == 0) {
+        float sum_sq = 0.0f;
+        for (int i = 0; i < num_warps; i++) sum_sq += shared[i];
+        shared[0] = dev_rsqrtf(sum_sq / (float)n_cols + eps);
+    }
+    __syncthreads();
+
+    float inv_std = shared[0];
+
+    // Phase 2: normalize and scale, cast back to BF16
+    for (int i = tid; i < n_cols; i += block_size) {
+        float normalized = __bfloat162float(row_in[i]) * inv_std * __bfloat162float(weight[i]);
+        row_out[i] = __float2bfloat16(normalized);
+    }
+}
+
+// Fused F16×F16 RMSNorm kernel: y = x * rsqrt(mean(x^2) + eps) * weight
+// Input/output/weight all __half. Computation in float32.
 #include <hip/hip_fp16.h>
+
+extern "C" __global__ void rmsnorm_f16_f16(
+    const __half* __restrict__ input,
+    __half* __restrict__ output,
+    const __half* __restrict__ weight,
+    const int n_cols,
+    const int block_size,
+    const float eps
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const __half* row_in = input + row * n_cols;
+    __half* row_out = output + row * n_cols;
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < n_cols; i += block_size) {
+        float v = __half2float(row_in[i]);
+        local_sum += v * v;
+    }
+
+    __shared__ float shared[32];
+    float val = local_sum;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down(val, offset);
+    }
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    if (lane_id == 0) shared[warp_id] = val;
+    __syncthreads();
+
+    int num_warps = (block_size + 31) / 32;
+    if (tid == 0) {
+        float sum_sq = 0.0f;
+        for (int i = 0; i < num_warps; i++) sum_sq += shared[i];
+        shared[0] = dev_rsqrtf(sum_sq / (float)n_cols + eps);
+    }
+    __syncthreads();
+
+    float inv_std = shared[0];
+
+    for (int i = tid; i < n_cols; i += block_size) {
+        float normalized = __half2float(row_in[i]) * inv_std * __half2float(weight[i]);
+        row_out[i] = __float2half(normalized);
+    }
+}
+
+// Fused F16 RMSNorm kernel: y = x * rsqrt(mean(x^2) + eps) * weight
+// Uses __half from hip_fp16.h (already included above)
 
 extern "C" __global__ void rmsnorm_f16(
     const __half* __restrict__ input,

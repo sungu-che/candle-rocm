@@ -6,11 +6,23 @@ use std::os::raw::c_int;
 pub type hipError_t = c_int;
 pub type hipDevice_t = c_int;
 pub type hipStream_t = *mut c_void;
+pub type hipEvent_t = *mut c_void;
 pub type hipModule_t = *mut c_void;
 pub type hipFunction_t = *mut c_void;
 pub type hipDeviceptr_t = *mut c_void;
 
 pub const HIP_SUCCESS: hipError_t = 0;
+pub const hipErrorNotReady: hipError_t = 2;
+
+// Stream flags for hipStreamCreateWithFlags
+pub const hipStreamDefault: u32 = 0;
+pub const hipStreamNonBlocking: u32 = 1;
+
+// Event flags for hipEventCreateWithFlags
+pub const hipEventDefault: u32 = 0;
+pub const hipEventBlockingSync: u32 = 1;
+pub const hipEventDisableTiming: u32 = 2;
+pub const hipEventInterprocess: u32 = 4;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -83,4 +95,49 @@ extern "C" {
     /// Both pointers must be valid. Returns HIP_SUCCESS on success.
     pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> hipError_t;
     pub fn hipGetErrorString(error: hipError_t) -> *const std::os::raw::c_char;
+
+    // ── Streams ─────────────────────────────────────────────────────────
+    /// Create an asynchronous stream.
+    pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;
+    /// Create a stream with the specified flags.
+    pub fn hipStreamCreateWithFlags(stream: *mut hipStream_t, flags: u32) -> hipError_t;
+    /// Destroy a stream.
+    pub fn hipStreamDestroy(stream: hipStream_t) -> hipError_t;
+    /// Wait for a stream to complete.
+    pub fn hipStreamSynchronize(stream: hipStream_t) -> hipError_t;
+    /// Query if a stream is complete.
+    pub fn hipStreamQuery(stream: hipStream_t) -> hipError_t;
+
+    // ── Events ──────────────────────────────────────────────────────────
+    /// Create a GPU event.
+    pub fn hipEventCreate(event: *mut hipEvent_t) -> hipError_t;
+    /// Create a GPU event with the specified flags.
+    pub fn hipEventCreateWithFlags(event: *mut hipEvent_t, flags: u32) -> hipError_t;
+    /// Destroy a GPU event.
+    pub fn hipEventDestroy(event: hipEvent_t) -> hipError_t;
+    /// Record an event on the given stream.
+    pub fn hipEventRecord(event: hipEvent_t, stream: hipStream_t) -> hipError_t;
+    /// Wait for an event to complete.
+    pub fn hipEventSynchronize(event: hipEvent_t) -> hipError_t;
+    /// Query if an event has been recorded.
+    pub fn hipEventQuery(event: hipEvent_t) -> hipError_t;
+    /// Get elapsed time between two events in milliseconds.
+    pub fn hipEventElapsedTime(ms: *mut f32, start: hipEvent_t, end: hipEvent_t) -> hipError_t;
+
+    // ── Async memory ops ────────────────────────────────────────────────
+    /// Asynchronous H2D copy.
+    pub fn hipMemcpyAsync(
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+        kind: hipMemcpyKind,
+        stream: hipStream_t,
+    ) -> hipError_t;
+    /// Asynchronous device memory set.
+    pub fn hipMemsetAsync(
+        dst: *mut c_void,
+        value: c_int,
+        size: usize,
+        stream: hipStream_t,
+    ) -> hipError_t;
 }

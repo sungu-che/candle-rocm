@@ -1,4 +1,5 @@
 #include "hip_utils.h"
+#include <hip/hip_fp16.h>
 
 // Fill buffer with constant value
 extern "C" __global__ void fill_f32(

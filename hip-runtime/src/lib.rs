@@ -4,3 +4,4 @@ pub mod module;
 pub mod blas;
 pub mod rng;
 pub mod error;
+pub mod stream;

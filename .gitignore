@@ -1,4 +1,6 @@
 /target
 *.hsaco
+*.o
 kernels/*.tmp
+kernels/*.src_hash
 *.tmp

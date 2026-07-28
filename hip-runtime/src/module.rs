@@ -1,11 +1,13 @@
 //! HIP module and kernel loading.
 
 use crate::error::{check_hip, HipError, Result};
+use crate::stream::HipStream;
 use hip_sys::hip_runtime;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::Path;
 
+#[derive(Clone)]
 pub struct HipModule {
     module: hip_runtime::hipModule_t,
     functions: HashMap<String, hip_runtime::hipFunction_t>,
@@ -37,7 +39,7 @@ impl HipModule {
         Ok(func)
     }
 
-    /// Launch a kernel.
+    /// Launch a kernel on the default (null) stream.
     pub unsafe fn launch(
         func: hip_runtime::hipFunction_t,
         grid: (u32, u32, u32),
@@ -55,6 +57,26 @@ impl HipModule {
             std::ptr::null_mut(),
         ))
     }
+
+    /// Launch a kernel on a specific stream (async, pipelined).
+    pub unsafe fn launch_on_stream(
+        func: hip_runtime::hipFunction_t,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared_mem: u32,
+        params: &mut [*mut std::ffi::c_void],
+        stream: &HipStream,
+    ) -> Result<()> {
+        check_hip(hip_runtime::hipModuleLaunchKernel(
+            func,
+            grid.0, grid.1, grid.2,
+            block.0, block.1, block.2,
+            shared_mem,
+            stream.as_raw(),
+            params.as_mut_ptr(),
+            std::ptr::null_mut(),
+        ))
+    }
 }
 
 unsafe impl Send for HipModule {}
@@ -68,12 +90,24 @@ impl Drop for HipModule {
 
 /// Compile a .hip source file to .hsaco using hipcc.
 pub fn compile_kernel(src: &Path, out: &Path, arch: &str) -> Result<()> {
-    // Find hipcc: prefer /opt/rocm/bin (upstream), fall back to PATH (Ubuntu apt)
-    let hipcc = if std::path::Path::new("/opt/rocm/bin/hipcc").exists() {
-        "/opt/rocm/bin/hipcc"
-    } else {
-        "hipcc"
-    };
+    // Discover hipcc in priority order:
+    // 1. $ROCM_PATH/bin/hipcc  (respects ROCM_PATH env, used by upstream installs)
+    // 2. /opt/rocm/bin/hipcc   (upstream AMD installer)
+    // 3. /usr/bin/hipcc        (Ubuntu/Debian apt package)
+    // 4. hipcc                 (PATH fallback for custom installations)
+    let rocm_path = std::env::var("ROCM_PATH")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/opt/rocm".to_string());
+    let hipcc = [
+        format!("{}/bin/hipcc", rocm_path),
+        "/opt/rocm/bin/hipcc".to_string(),
+        "/usr/bin/hipcc".to_string(),
+        "hipcc".to_string(),
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(p).exists())
+    .unwrap_or_else(|| "hipcc".to_string());
     // On Ubuntu-packaged ROCm, the system math.h declares host-only functions
     // that conflict with HIP device math intrinsics. Use --rocm-path and
     // include the HIP wrapper to get proper device-side declarations.

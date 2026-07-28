@@ -19,7 +19,9 @@ impl RocmStorage {
     ) -> Result<Option<Self>> {
         match op_name {
             "softmax-last-dim" => {
-                if self.dtype != DType::F32 || !layout.is_contiguous() {
+                if (self.dtype != DType::F32 && self.dtype != DType::F16)
+                    || !layout.is_contiguous()
+                {
                     return Ok(None);
                 }
                 let dims = layout.dims();
@@ -27,43 +29,68 @@ impl RocmStorage {
                 let nrows = layout.shape().elem_count() / last_dim;
                 let ncols = last_dim;
 
-                let out_buf = self.device.alloc_buf(layout.shape().elem_count() * 4)?;
-                let inp_ptr = unsafe {
-                    (self.buf.as_ptr() as *const f32).add(layout.start_offset())
-                };
-                let out_ptr = out_buf.as_mut_ptr() as *mut f32;
+                let elem_size = self.dtype.size_in_bytes();
+                let out_buf = self.device.alloc_buf(layout.shape().elem_count() * elem_size)?;
                 let nrows_u = nrows as usize;
                 let ncols_u = ncols as usize;
 
-                self.device.with_module("softmax", |module, _| {
-                    let func = module
-                        .get_function("softmax_f32")
-                        .map_err(|e| err!("{e}"))?;
-                    let block = 256u32;
-                    let grid = nrows as u32;
-                    let shared_mem = (block * 4) as u32;
-                    unsafe {
-                        let mut p: Vec<*mut std::ffi::c_void> = vec![
-                            &inp_ptr as *const _ as *mut _,
-                            &out_ptr as *const _ as *mut _,
-                            &nrows_u as *const _ as *mut _,
-                            &ncols_u as *const _ as *mut _,
-                        ];
-                        HipModule::launch(
-                            func,
-                            (grid, 1, 1),
-                            (block, 1, 1),
-                            shared_mem,
-                            &mut p,
-                        )
-                        .map_err(|e| err!("softmax kernel: {e}"))?;
+                match self.dtype {
+                    DType::F32 => {
+                        let inp_ptr = unsafe {
+                            (self.buf.as_ptr() as *const f32).add(layout.start_offset())
+                        };
+                        let out_ptr = out_buf.as_mut_ptr() as *mut f32;
+                        self.device.with_module("softmax", |module, _| {
+                            let func = module
+                                .get_function("softmax_f32")
+                                .map_err(|e| err!("{e}"))?;
+                            let block = 256u32;
+                            let grid = nrows as u32;
+                            let shared_mem = (block * 4) as u32;
+                            unsafe {
+                                let mut p: Vec<*mut std::ffi::c_void> = vec![
+                                    &inp_ptr as *const _ as *mut _,
+                                    &out_ptr as *const _ as *mut _,
+                                    &nrows_u as *const _ as *mut _,
+                                    &ncols_u as *const _ as *mut _,
+                                ];
+                                HipModule::launch(func, (grid, 1, 1), (block, 1, 1), shared_mem, &mut p)
+                                    .map_err(|e| err!("softmax kernel: {e}"))?;
+                            }
+                            Ok(())
+                        })?;
                     }
-                    Ok(())
-                })?;
+                    DType::F16 => {
+                        let inp_ptr = unsafe {
+                            (self.buf.as_ptr() as *const u16).add(layout.start_offset())
+                        };
+                        let out_ptr = out_buf.as_mut_ptr() as *mut u16;
+                        self.device.with_module("softmax", |module, _| {
+                            let func = module
+                                .get_function("softmax_f16")
+                                .map_err(|e| err!("{e}"))?;
+                            let block = 256u32;
+                            let grid = nrows as u32;
+                            let shared_mem = (block * 4) as u32; // F32 shared mem for reduction
+                            unsafe {
+                                let mut p: Vec<*mut std::ffi::c_void> = vec![
+                                    &inp_ptr as *const _ as *mut _,
+                                    &out_ptr as *const _ as *mut _,
+                                    &nrows_u as *const _ as *mut _,
+                                    &ncols_u as *const _ as *mut _,
+                                ];
+                                HipModule::launch(func, (grid, 1, 1), (block, 1, 1), shared_mem, &mut p)
+                                    .map_err(|e| err!("softmax_f16 kernel: {e}"))?;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    _ => unreachable!(),
+                }
 
                 Ok(Some(RocmStorage {
                     buf: out_buf,
-                    dtype: DType::F32,
+                    dtype: self.dtype,
                     device: self.device.clone(),
                 }))
             }
@@ -142,8 +169,7 @@ impl RocmStorage {
                         }))
                     }
                     (DType::BF16, DType::F32) => {
-                        // BF16 path: input/output BF16, weights F32 (common for LLMs)
-                        // Kernel does F32 reduction internally, outputs BF16
+                        // BF16 input, F32 weight. Kernel does F32 reduction, outputs BF16.
                         let out_buf = self.device.alloc_buf(layout.shape().elem_count() * 2)?;
                         let inp_ptr = unsafe {
                             (self.buf.as_ptr() as *const u16).add(layout.start_offset())
@@ -174,6 +200,48 @@ impl RocmStorage {
                                     &mut p,
                                 )
                                 .map_err(|e| err!("rmsnorm_bf16 kernel: {e}"))?;
+                            }
+                            Ok(())
+                        })?;
+
+                        Ok(Some(RocmStorage {
+                            buf: out_buf,
+                            dtype: DType::BF16,
+                            device: self.device.clone(),
+                        }))
+                    }
+                    (DType::BF16, DType::BF16) => {
+                        // BF16 input + BF16 weight. Dedicated kernel, F32 internal compute.
+                        let out_buf = self.device.alloc_buf(layout.shape().elem_count() * 2)?;
+                        let inp_ptr = unsafe {
+                            (self.buf.as_ptr() as *const u16).add(layout.start_offset())
+                        };
+                        let out_ptr = out_buf.as_mut_ptr() as *mut u16;
+                        let w_ptr = unsafe {
+                            (rhs.buf.as_ptr() as *const u16).add(rhs_l.start_offset())
+                        };
+
+                        self.device.with_module("norm", |module, _| {
+                            let func = module
+                                .get_function("rmsnorm_bf16_bf16")
+                                .map_err(|e| err!("{e}"))?;
+                            unsafe {
+                                let mut p: Vec<*mut std::ffi::c_void> = vec![
+                                    &inp_ptr as *const _ as *mut _,
+                                    &out_ptr as *const _ as *mut _,
+                                    &w_ptr as *const _ as *mut _,
+                                    &n_cols_i as *const _ as *mut _,
+                                    &block_size as *const _ as *mut _,
+                                    &eps as *const _ as *mut _,
+                                ];
+                                HipModule::launch(
+                                    func,
+                                    (n_rows as u32, 1, 1),
+                                    (block_size as u32, 1, 1),
+                                    0,
+                                    &mut p,
+                                )
+                                .map_err(|e| err!("rmsnorm_bf16_bf16 kernel: {e}"))?;
                             }
                             Ok(())
                         })?;
@@ -226,6 +294,48 @@ impl RocmStorage {
                             device: self.device.clone(),
                         }))
                     }
+                    (DType::F16, DType::F16) => {
+                        // F16 input + F16 weight. Dedicated kernel, F32 internal compute.
+                        let out_buf = self.device.alloc_buf(layout.shape().elem_count() * 2)?;
+                        let inp_ptr = unsafe {
+                            (self.buf.as_ptr() as *const u16).add(layout.start_offset())
+                        };
+                        let out_ptr = out_buf.as_mut_ptr() as *mut u16;
+                        let w_ptr = unsafe {
+                            (rhs.buf.as_ptr() as *const u16).add(rhs_l.start_offset())
+                        };
+
+                        self.device.with_module("norm", |module, _| {
+                            let func = module
+                                .get_function("rmsnorm_f16_f16")
+                                .map_err(|e| err!("{e}"))?;
+                            unsafe {
+                                let mut p: Vec<*mut std::ffi::c_void> = vec![
+                                    &inp_ptr as *const _ as *mut _,
+                                    &out_ptr as *const _ as *mut _,
+                                    &w_ptr as *const _ as *mut _,
+                                    &n_cols_i as *const _ as *mut _,
+                                    &block_size as *const _ as *mut _,
+                                    &eps as *const _ as *mut _,
+                                ];
+                                HipModule::launch(
+                                    func,
+                                    (n_rows as u32, 1, 1),
+                                    (block_size as u32, 1, 1),
+                                    0,
+                                    &mut p,
+                                )
+                                .map_err(|e| err!("rmsnorm_f16_f16 kernel: {e}"))?;
+                            }
+                            Ok(())
+                        })?;
+
+                        Ok(Some(RocmStorage {
+                            buf: out_buf,
+                            dtype: DType::F16,
+                            device: self.device.clone(),
+                        }))
+                    }
                     _ => Ok(None), // Fallback for unsupported dtype combinations
                 }
             }
@@ -246,12 +356,14 @@ impl RocmStorage {
     where
         F: FnOnce(&CpuStorage, &Layout) -> Result<CpuStorage>,
     {
+        eprintln!("[CPU-FB] unary dtype={:?} shape={:?}", self.dtype, layout.shape());
         let cpu = self.to_cpu()?;
         let result = f(&cpu, layout)?;
         self.device.storage_from_cpu_storage(&result)
     }
 
     /// Fall back for binary ops that need two inputs.
+    /// For matmul with BF16 inputs, converts both to F32, computes, then converts back.
     fn cpu_fallback_binary<F>(
         &self,
         rhs: &Self,
@@ -262,9 +374,152 @@ impl RocmStorage {
     where
         F: FnOnce(&CpuStorage, &CpuStorage, &Layout, &Layout) -> Result<CpuStorage>,
     {
+        // eprintln!("[CPU-FB] binary lhs={:?} rhs={:?} shape={:?} lhs_cont={} rhs_cont={}", self.dtype, rhs.dtype, lhs_l.shape(), lhs_l.is_contiguous(), rhs_l.is_contiguous());
         let lhs_cpu = self.to_cpu()?;
         let rhs_cpu = rhs.to_cpu()?;
-        let result = f(&lhs_cpu, &rhs_cpu, lhs_l, rhs_l)?;
+        // BF16 matmul: the CPU MatMul only supports F16/F32/F64.
+        // Intercept here: convert both to F32, call matmul, convert result to BF16.
+        if self.dtype == DType::BF16 && rhs.dtype == DType::BF16 {
+            let lhs_f32_storage = match lhs_cpu {
+                CpuStorage::BF16(v) => CpuStorage::F32(
+                    v.iter().map(|&b| b.to_f32()).collect(),
+                ),
+                _ => unreachable!("lhs should be BF16"),
+            };
+            let rhs_f32_storage = match rhs_cpu {
+                CpuStorage::BF16(v) => CpuStorage::F32(
+                    v.iter().map(|&b| b.to_f32()).collect(),
+                ),
+                _ => unreachable!("rhs should be BF16"),
+            };
+
+            let result_f32 = f(&lhs_f32_storage, &rhs_f32_storage, lhs_l, rhs_l)?;
+
+            // Convert F32 result → BF16
+            let CpuStorage::F32(floats) = result_f32 else {
+                return Err(err!("matmul result should be F32"));
+            };
+            let bf16_data: Vec<half::bf16> = floats
+                .iter()
+                .map(|&f| half::bf16::from_f32(f))
+                .collect();
+            let elem_count = bf16_data.len();
+            let byte_len = elem_count * 2;
+
+            // Upload BF16 to GPU
+            let mut bytes = vec![0u8; byte_len];
+            for (i, &bf) in bf16_data.iter().enumerate() {
+                bytes[i * 2..i * 2 + 2].copy_from_slice(&bf.to_le_bytes());
+            }
+            let dst_buf = DeviceBuffer::from_host_bytes(&bytes)
+                .map_err(|e| err!("bf16 upload failed: {e}"))?;
+            return Ok(RocmStorage { buf: dst_buf, dtype: DType::BF16, device: self.device.clone() });
+        }
+
+        // BF16 × F32 matmul: CPU matmul supports F32×F32. Convert lhs to F32, call matmul, convert result to BF16.
+        if self.dtype == DType::BF16 && rhs.dtype == DType::F32 {
+            let lhs_f32_storage = match lhs_cpu {
+                CpuStorage::BF16(v) => CpuStorage::F32(
+                    v.iter().map(|&b| b.to_f32()).collect(),
+                ),
+                _ => unreachable!("lhs should be BF16"),
+            };
+            let result_f32 = f(&lhs_f32_storage, &rhs_cpu, lhs_l, rhs_l)?;
+
+            let CpuStorage::F32(floats) = result_f32 else {
+                return Err(err!("matmul result should be F32"));
+            };
+            let bf16_data: Vec<half::bf16> = floats
+                .iter()
+                .map(|&f| half::bf16::from_f32(f))
+                .collect();
+            let elem_count = bf16_data.len();
+            let byte_len = elem_count * 2;
+            let mut bytes = vec![0u8; byte_len];
+            for (i, &bf) in bf16_data.iter().enumerate() {
+                bytes[i * 2..i * 2 + 2].copy_from_slice(&bf.to_le_bytes());
+            }
+            let dst_buf = DeviceBuffer::from_host_bytes(&bytes)
+                .map_err(|e| err!("bf16 upload failed: {e}"))?;
+            return Ok(RocmStorage { buf: dst_buf, dtype: DType::BF16, device: self.device.clone() });
+        }
+
+        // F32 × BF16 matmul: convert rhs to F32, call matmul.
+        if self.dtype == DType::F32 && rhs.dtype == DType::BF16 {
+            let rhs_f32_storage = match rhs_cpu {
+                CpuStorage::BF16(v) => CpuStorage::F32(
+                    v.iter().map(|&b| b.to_f32()).collect(),
+                ),
+                _ => unreachable!("rhs should be BF16"),
+            };
+            return self.device.storage_from_cpu_storage(&f(&lhs_cpu, &rhs_f32_storage, lhs_l, rhs_l)?);
+        }
+
+        // Catch-all: convert lhs or rhs BF16 to F32, call CPU op, re-upload if needed.
+        let result = if self.dtype == DType::BF16 {
+            let lhs_f32 = match lhs_cpu {
+                CpuStorage::BF16(v) => CpuStorage::F32(
+                    v.iter().map(|&b| b.to_f32()).collect(),
+                ),
+                _ => unreachable!("lhs should be BF16"),
+            };
+            // Also convert rhs if it's BF16
+            let rhs_f32 = if rhs.dtype == DType::BF16 {
+                match rhs_cpu {
+                    CpuStorage::BF16(v) => CpuStorage::F32(
+                        v.iter().map(|&b| b.to_f32()).collect(),
+                    ),
+                    _ => unreachable!("rhs should be BF16"),
+                }
+            } else {
+                rhs_cpu
+            };
+            f(&lhs_f32, &rhs_f32, lhs_l, rhs_l)?
+        } else {
+            // self is not BF16 but rhs might be
+            if rhs.dtype == DType::BF16 {
+                let rhs_f32 = match rhs_cpu {
+                    CpuStorage::BF16(v) => CpuStorage::F32(
+                        v.iter().map(|&b| b.to_f32()).collect(),
+                    ),
+                    _ => unreachable!("rhs should be BF16"),
+                };
+                f(&lhs_cpu, &rhs_f32, lhs_l, rhs_l)?
+            } else {
+                f(&lhs_cpu, &rhs_cpu, lhs_l, rhs_l)?
+            }
+        };
+
+        // BF16 result: convert F32 → BF16 and upload.
+        if self.dtype == DType::BF16 {
+            let elem_count = lhs_l.shape().elem_count();
+            let byte_len = elem_count * 2;
+            let CpuStorage::F32(floats) = &result else {
+                // Result already BF16
+                let CpuStorage::BF16(v) = &result else {
+                    return self.device.storage_from_cpu_storage(&result);
+                };
+                let mut bytes = vec![0u8; byte_len];
+                for (i, &bf) in v.iter().enumerate() {
+                    bytes[i * 2..i * 2 + 2].copy_from_slice(&bf.to_le_bytes());
+                }
+                let dst_buf = DeviceBuffer::from_host_bytes(&bytes)
+                    .map_err(|e| err!("bf16 upload failed: {e}"))?;
+                return Ok(RocmStorage { buf: dst_buf, dtype: DType::BF16, device: self.device.clone() });
+            };
+            let bf16_data: Vec<half::bf16> = floats
+                .iter()
+                .map(|&f| half::bf16::from_f32(f))
+                .collect();
+            let mut bytes = vec![0u8; byte_len];
+            for (i, &bf) in bf16_data.iter().enumerate() {
+                bytes[i * 2..i * 2 + 2].copy_from_slice(&bf.to_le_bytes());
+            }
+            let dst_buf = DeviceBuffer::from_host_bytes(&bytes)
+                .map_err(|e| err!("bf16 upload failed: {e}"))?;
+            return Ok(RocmStorage { buf: dst_buf, dtype: DType::BF16, device: self.device.clone() });
+        }
+
         self.device.storage_from_cpu_storage(&result)
     }
 }
@@ -319,33 +574,53 @@ impl BackendStorage for RocmStorage {
                     hip_sys::hip_runtime::hipMemcpyKind::hipMemcpyDeviceToDevice,
                 );
             }
-        } else if self.dtype == DType::F32 {
+        } else if self.dtype == DType::F32 || self.dtype == DType::F16 {
+            let is_f16 = self.dtype == DType::F16;
             let info: Vec<usize> = [layout.dims(), layout.stride()].concat();
             let info_buf = DeviceBuffer::from_slice(&info)
                 .map_err(|e| err!("info upload failed: {e}"))?;
             self.device.with_module("fill", |module, _| {
+                let kernel_name = if is_f16 { "copy_strided_f16" } else { "copy_strided_f32" };
                 let func = module
-                    .get_function("copy_strided_f32")
+                    .get_function(kernel_name)
                     .map_err(|e| err!("{e}"))?;
                 let (grid, block) = launch_cfg(numel);
                 let num_dims = layout.dims().len();
                 let info_ptr = info_buf.as_ptr();
-                let src_ptr = self.buf.as_ptr() as *const f32;
-                let dst_ptr = out_buf.as_mut_ptr() as *mut f32;
                 let src_offset = layout.start_offset();
                 let dst_offset: usize = 0;
-                unsafe {
-                    let mut params: Vec<*mut std::ffi::c_void> = vec![
-                        &src_ptr as *const _ as *mut _,
-                        &dst_ptr as *const _ as *mut _,
-                        &numel as *const _ as *mut _,
-                        &num_dims as *const _ as *mut _,
-                        &info_ptr as *const _ as *mut _,
-                        &src_offset as *const _ as *mut _,
-                        &dst_offset as *const _ as *mut _,
-                    ];
-                    HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
-                        .map_err(|e| err!("{e}"))?;
+                if is_f16 {
+                    let src_ptr = self.buf.as_ptr() as *const u16;
+                    let dst_ptr = out_buf.as_mut_ptr() as *mut u16;
+                    unsafe {
+                        let mut params: Vec<*mut std::ffi::c_void> = vec![
+                            &src_ptr as *const _ as *mut _,
+                            &dst_ptr as *const _ as *mut _,
+                            &numel as *const _ as *mut _,
+                            &num_dims as *const _ as *mut _,
+                            &info_ptr as *const _ as *mut _,
+                            &src_offset as *const _ as *mut _,
+                            &dst_offset as *const _ as *mut _,
+                        ];
+                        HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+                            .map_err(|e| err!("{e}"))?;
+                    }
+                } else {
+                    let src_ptr = self.buf.as_ptr() as *const f32;
+                    let dst_ptr = out_buf.as_mut_ptr() as *mut f32;
+                    unsafe {
+                        let mut params: Vec<*mut std::ffi::c_void> = vec![
+                            &src_ptr as *const _ as *mut _,
+                            &dst_ptr as *const _ as *mut _,
+                            &numel as *const _ as *mut _,
+                            &num_dims as *const _ as *mut _,
+                            &info_ptr as *const _ as *mut _,
+                            &src_offset as *const _ as *mut _,
+                            &dst_offset as *const _ as *mut _,
+                        ];
+                        HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+                            .map_err(|e| err!("{e}"))?;
+                    }
                 }
                 Ok(())
             })?;
@@ -370,6 +645,10 @@ impl BackendStorage for RocmStorage {
 
     fn to_cpu_storage(&self) -> Result<CpuStorage> {
         self.to_cpu()
+    }
+
+    fn reshape(&self, layout: &Layout) -> Result<Self> {
+        BackendStorage::try_clone(self, layout)
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
@@ -492,104 +771,82 @@ impl BackendStorage for RocmStorage {
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
-        if self.dtype != DType::F32 {
-            return self.cpu_fallback(layout, |cpu, l| cpu.reduce_op(op, l, reduce_dims));
-        }
+        // F16/BF16 reduce outputs float (accumulate in float for precision)
+        let (kernel_name, out_dtype) = match (self.dtype, op) {
+            (DType::F32, ReduceOp::Sum) => ("fast_sum_f32", DType::F32),
+            (DType::F32, ReduceOp::Max) => ("fast_max_f32", DType::F32),
+            (DType::F32, ReduceOp::Min) => ("fast_min_f32", DType::F32),
+            (DType::F32, ReduceOp::ArgMax) => ("fast_argmax_f32", DType::U32),
+            (DType::F32, ReduceOp::ArgMin) => ("fast_argmin_f32", DType::U32),
+            (DType::F16, ReduceOp::Sum) => ("fast_sum_f16", DType::F32),
+            (DType::F16, ReduceOp::Max) => ("fast_max_f16", DType::F32),
+            (DType::F16, ReduceOp::Min) => ("fast_min_f16", DType::F32),
+            (DType::F16, ReduceOp::ArgMax) => ("fast_argmax_f16", DType::U32),
+            (DType::F16, ReduceOp::ArgMin) => ("fast_argmin_f16", DType::U32),
+            (DType::BF16, ReduceOp::Sum) => ("fast_sum_bf16", DType::F32),
+            (DType::BF16, ReduceOp::Max) => ("fast_max_bf16", DType::F32),
+            (DType::BF16, ReduceOp::Min) => ("fast_min_bf16", DType::F32),
+            (DType::BF16, ReduceOp::ArgMax) => ("fast_argmax_bf16", DType::U32),
+            (DType::BF16, ReduceOp::ArgMin) => ("fast_argmin_bf16", DType::U32),
+            _ => {
+                return self
+                    .cpu_fallback(layout, |cpu, l| cpu.reduce_op(op, l, reduce_dims));
+            }
+        };
 
         let (info_vec, out_numel, reduce_size) = reduce_info(layout, reduce_dims);
         let num_dims = layout.dims().len();
-        let info_buf = DeviceBuffer::from_slice(&info_vec)
-            .map_err(|e| err!("info upload failed: {e}"))?;
+        let info_buf =
+            DeviceBuffer::from_slice(&info_vec).map_err(|e| err!("info upload failed: {e}"))?;
 
         let block = 256u32;
         let grid = out_numel as u32;
-        let shared_bytes = block as u32 * 4; // sizeof(float) per thread
+        // argmax/argmin: float[block] + u32[block] in shared mem
+        let is_arg = matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin);
+        let shared_bytes = if is_arg {
+            block * (4 + 4)
+        } else {
+            block * 4 // sizeof(float)
+        };
 
-        match op {
-            ReduceOp::Sum | ReduceOp::Min | ReduceOp::Max => {
-                let out_buf = self.device.alloc_buf(out_numel * 4)?;
-                let kernel_name = match op {
-                    ReduceOp::Sum => "fast_sum_f32",
-                    ReduceOp::Max => "fast_max_f32",
-                    ReduceOp::Min => "fast_min_f32",
-                    _ => unreachable!(),
-                };
-                self.device.with_module("reduce", |module, _| {
-                    let func = module.get_function(kernel_name).map_err(|e| err!("{e}"))?;
-                    let info_ptr = info_buf.as_ptr();
-                    let inp_ptr = unsafe {
-                        (self.buf.as_ptr() as *const f32).add(layout.start_offset())
-                    };
-                    let out_ptr = out_buf.as_mut_ptr() as *mut f32;
-                    unsafe {
-                        let mut params: Vec<*mut std::ffi::c_void> = vec![
-                            &inp_ptr as *const _ as *mut _,
-                            &out_ptr as *const _ as *mut _,
-                            &info_ptr as *const _ as *mut _,
-                            &out_numel as *const _ as *mut _,
-                            &reduce_size as *const _ as *mut _,
-                            &num_dims as *const _ as *mut _,
-                        ];
-                        HipModule::launch(
-                            func,
-                            (grid.max(1), 1, 1),
-                            (block, 1, 1),
-                            shared_bytes,
-                            &mut params,
-                        )
-                        .map_err(|e| err!("{e}"))?;
-                    }
-                    Ok(())
-                })?;
-                Ok(RocmStorage {
-                    buf: out_buf,
-                    dtype: DType::F32,
-                    device: self.device.clone(),
-                })
+        let out_byte_size = if is_arg { 4 } else { 4 }; // u32 or f32
+        let out_buf = self.device.alloc_buf(out_numel * out_byte_size)?;
+
+        self.device.with_module("reduce", |module, _| {
+            let func = module.get_function(kernel_name).map_err(|e| err!("{e}"))?;
+            let info_ptr = info_buf.as_ptr();
+            let inp_ptr = match self.dtype {
+                DType::F32 => unsafe { (self.buf.as_ptr() as *const f32).add(layout.start_offset()) as *const _ },
+                DType::F16 => unsafe { (self.buf.as_ptr() as *const u16).add(layout.start_offset()) as *const _ },
+                DType::BF16 => unsafe { (self.buf.as_ptr() as *const u16).add(layout.start_offset()) as *const _ },
+                _ => unreachable!(),
+            };
+            let out_ptr = out_buf.as_mut_ptr() as *mut std::ffi::c_void;
+            unsafe {
+                let mut params: Vec<*mut std::ffi::c_void> = vec![
+                    &inp_ptr as *const _ as *mut _,
+                    &out_ptr as *const _ as *mut _,
+                    &info_ptr as *const _ as *mut _,
+                    &out_numel as *const _ as *mut _,
+                    &reduce_size as *const _ as *mut _,
+                    &num_dims as *const _ as *mut _,
+                ];
+                HipModule::launch(
+                    func,
+                    (grid.max(1), 1, 1),
+                    (block, 1, 1),
+                    shared_bytes,
+                    &mut params,
+                )
+                .map_err(|e| err!("{e}"))?;
             }
-            ReduceOp::ArgMax | ReduceOp::ArgMin => {
-                let out_buf = self.device.alloc_buf(out_numel * 4)?; // u32 output
-                let kernel_name = match op {
-                    ReduceOp::ArgMax => "fast_argmax_f32",
-                    ReduceOp::ArgMin => "fast_argmin_f32",
-                    _ => unreachable!(),
-                };
-                // argmax/argmin need float + u32 in shared memory
-                let shared_bytes = block as u32 * (4 + 4);
-                self.device.with_module("reduce", |module, _| {
-                    let func = module.get_function(kernel_name).map_err(|e| err!("{e}"))?;
-                    let info_ptr = info_buf.as_ptr();
-                    let inp_ptr = unsafe {
-                        (self.buf.as_ptr() as *const f32).add(layout.start_offset())
-                    };
-                    let out_ptr = out_buf.as_mut_ptr() as *mut u32;
-                    unsafe {
-                        let mut params: Vec<*mut std::ffi::c_void> = vec![
-                            &inp_ptr as *const _ as *mut _,
-                            &out_ptr as *const _ as *mut _,
-                            &info_ptr as *const _ as *mut _,
-                            &out_numel as *const _ as *mut _,
-                            &reduce_size as *const _ as *mut _,
-                            &num_dims as *const _ as *mut _,
-                        ];
-                        HipModule::launch(
-                            func,
-                            (grid.max(1), 1, 1),
-                            (block, 1, 1),
-                            shared_bytes,
-                            &mut params,
-                        )
-                        .map_err(|e| err!("{e}"))?;
-                    }
-                    Ok(())
-                })?;
-                Ok(RocmStorage {
-                    buf: out_buf,
-                    dtype: DType::U32,
-                    device: self.device.clone(),
-                })
-            }
-        }
+            Ok(())
+        })?;
+        Ok(RocmStorage {
+            buf: out_buf,
+            dtype: out_dtype,
+            device: self.device.clone(),
+        })
     }
 
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
@@ -664,6 +921,10 @@ impl BackendStorage for RocmStorage {
             // F16↔F32 — attention bottleneck, keeps tensors on GPU
             (DType::F16, DType::F32) => Some("cast_f16_f32"),
             (DType::F32, DType::F16) => Some("cast_f32_f16"),
+            (DType::BF16, DType::F32) => Some("cast_bf16_f32"),
+            (DType::F32, DType::BF16) => Some("cast_f32_bf16"),
+            (DType::BF16, DType::F16) => Some("cast_bf16_f16"),
+            (DType::F16, DType::BF16) => Some("cast_f16_bf16"),
             _ => None,
         };
 
@@ -705,29 +966,38 @@ impl BackendStorage for RocmStorage {
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
-        if self.dtype != DType::F32 {
-            return self.cpu_fallback(layout, |cpu, l| cpu.unary_impl::<B>(l));
-        }
-        let func_name = format!("{}_f32", B::KERNEL);
+        let (func_name, byte_size) = match self.dtype {
+            DType::F32 => (format!("{}_f32", B::KERNEL), 4),
+            DType::F16 => (format!("{}_f16", B::KERNEL), 2),
+            DType::BF16 => (format!("{}_bf16", B::KERNEL), 2),
+            _ => {
+                return self.cpu_fallback(layout, |cpu, l| cpu.unary_impl::<B>(l));
+            }
+        };
         let numel = layout.shape().elem_count();
-        let out_buf = self.device.alloc_buf(numel * 4)?;
+        let out_buf = self.device.alloc_buf(numel * byte_size)?;
         let info = self.device.upload_info(layout)?;
 
         self.device.with_module("unary", |module, _| {
             let func = module.get_function(&func_name).map_err(|e| err!("{e}"))?;
             let (grid, block) = launch_cfg(numel);
             let num_dims = layout.dims().len();
-            let info_ptr: *const usize = info.as_ref().map_or(std::ptr::null(), |b| b.as_ptr());
-            let inp_ptr =
-                unsafe { (self.buf.as_ptr() as *const f32).add(layout.start_offset()) };
-            let out_ptr = out_buf.as_mut_ptr() as *mut f32;
+            let info_ptr: *const usize =
+                info.as_ref().map_or(std::ptr::null(), |b| b.as_ptr());
+            let inp_ptr = match self.dtype {
+                DType::F32 => unsafe { (self.buf.as_ptr() as *const f32).add(layout.start_offset()) as *const _ },
+                DType::F16 => unsafe { (self.buf.as_ptr() as *const u16).add(layout.start_offset()) as *const _ },
+                DType::BF16 => unsafe { (self.buf.as_ptr() as *const u16).add(layout.start_offset()) as *const _ },
+                _ => unreachable!(),
+            };
+            let out_ptr_void = out_buf.as_mut_ptr() as *mut std::ffi::c_void;
             unsafe {
                 let mut params: Vec<*mut std::ffi::c_void> = vec![
                     &numel as *const _ as *mut _,
                     &num_dims as *const _ as *mut _,
                     &info_ptr as *const _ as *mut _,
                     &inp_ptr as *const _ as *mut _,
-                    &out_ptr as *const _ as *mut _,
+                    &out_ptr_void as *const _ as *mut _,
                 ];
                 HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
                     .map_err(|e| err!("{e}"))?;
@@ -736,7 +1006,7 @@ impl BackendStorage for RocmStorage {
         })?;
         Ok(RocmStorage {
             buf: out_buf,
-            dtype: DType::F32,
+            dtype: self.dtype,
             device: self.device.clone(),
         })
     }
@@ -747,26 +1017,132 @@ impl BackendStorage for RocmStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 {
+        // Handle mixed BF16/F32 on GPU: dispatch to binary_mixed kernel.
+        // BF16 lhs, F32 rhs → BF16 out. Avoids CPU fallback for RoPE/attention/mask.
+        if self.dtype == DType::BF16 && rhs.dtype == DType::F32 {
+            let numel = lhs_l.shape().elem_count();
+            let out_buf = self.device.alloc_buf(numel * 2)?;
+            let kernel_name = match B::NAME {
+                "mul" => "mul_bf16_f32",
+                "add" => "add_bf16_f32",
+                "sub" => "sub_bf16_f32",
+                _ => {
+                    return self.cpu_fallback_binary(rhs, lhs_l, rhs_l, |lc, rc, ll, rl| {
+                        lc.binary_impl::<B>(rc, ll, rl)
+                    });
+                }
+            };
+            let lhs_ptr = unsafe {
+                (self.buf.as_ptr() as *const u16).add(lhs_l.start_offset()) as *const std::ffi::c_void
+            };
+            let rhs_ptr = unsafe {
+                (rhs.buf.as_ptr() as *const f32).add(rhs_l.start_offset()) as *const std::ffi::c_void
+            };
+            let out_ptr = out_buf.as_mut_ptr() as *mut std::ffi::c_void;
+            self.device.with_module("binary_mixed", |module, _| {
+                let func = module.get_function(kernel_name).map_err(|e| err!("{e}"))?;
+                let (grid, block) = launch_cfg(numel);
+                // Upload layout info for non-contiguous tensors
+                let info: Vec<usize> = if lhs_l.is_contiguous() {
+                    vec![]
+                } else {
+                    [lhs_l.dims(), lhs_l.stride()].concat()
+                };
+                let info_buf = if info.is_empty() {
+                    None
+                } else {
+                    Some(DeviceBuffer::from_slice(&info).map_err(|e| err!("info: {e}"))?)
+                };
+                let info_ptr: *const usize = info_buf.as_ref().map_or(std::ptr::null(), |b| b.as_ptr());
+                let num_dims = lhs_l.dims().len();
+                unsafe {
+                    let mut params: Vec<*mut std::ffi::c_void> = vec![
+                        &numel as *const _ as *mut _,
+                        &num_dims as *const _ as *mut _,
+                        &info_ptr as *const _ as *mut _,
+                        &lhs_ptr as *const _ as *mut _,
+                        &rhs_ptr as *const _ as *mut _,
+                        &out_ptr as *const _ as *mut _,
+                    ];
+                    HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+                        .map_err(|e| err!("binary_mixed kernel: {e}"))
+                }
+            })?;
+            return Ok(RocmStorage {
+                buf: out_buf,
+                dtype: DType::BF16,
+                device: self.device.clone(),
+            });
+        }
+        if self.dtype == DType::F32 && rhs.dtype == DType::BF16 {
+            // Cast F32 tensor → BF16 on GPU, then dispatch BF16 binary kernel.
+            // Output dtype matches lhs (F32), but binary kernel dispatches on matched dtypes.
+            // Since lhs=F32 rhs=BF16 and we want F32 output, we cast lhs BF16 instead.
+            let numel = lhs_l.shape().elem_count();
+            let bf16_buf = self.device.alloc_buf(numel * 2)?;
+            let f32_ptr = unsafe { (self.buf.as_ptr() as *const f32).add(lhs_l.start_offset()) };
+            let bf16_ptr = bf16_buf.as_mut_ptr() as *mut u16;
+            self.device.with_module("cast", |module, _| {
+                let func = module.get_function("cast_f32_bf16")
+                    .map_err(|e| err!("cast_f32_bf16 kernel: {e}"))?;
+                let (grid, block) = launch_cfg(numel);
+                let num_dims: usize = 0;
+                let info_ptr: *const usize = std::ptr::null();
+                let mut params: Vec<*mut std::ffi::c_void> = vec![
+                    &numel as *const _ as *mut _,
+                    &num_dims as *const _ as *mut _,
+                    &info_ptr as *const _ as *mut _,
+                    f32_ptr as *const _ as *mut _,
+                    bf16_ptr as *mut _,
+                ];
+                unsafe {
+                    HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+                        .map_err(|e| err!("cast kernel: {e}"))
+                }
+            })?;
+            let lhs_bf16 = RocmStorage { buf: bf16_buf, dtype: DType::BF16, device: self.device.clone() };
+            return lhs_bf16.binary_impl::<B>(rhs, lhs_l, rhs_l);
+        }
+
+        // Dispatch to GPU kernel based on dtype. All operands must match.
+        if self.dtype != rhs.dtype {
             return self.cpu_fallback_binary(rhs, lhs_l, rhs_l, |lc, rc, ll, rl| {
                 lc.binary_impl::<B>(rc, ll, rl)
             });
         }
-        let func_name = format!("{}_f32", B::KERNEL);
+        let (func_name, byte_size) = match self.dtype {
+            DType::F32 => (format!("{}_f32", B::KERNEL), 4),
+            DType::F16 => (format!("{}_f16", B::KERNEL), 2),
+            DType::BF16 => (format!("{}_bf16", B::KERNEL), 2),
+            _ => {
+                return self.cpu_fallback_binary(rhs, lhs_l, rhs_l, |lc, rc, ll, rl| {
+                    lc.binary_impl::<B>(rc, ll, rl)
+                });
+            }
+        };
         let numel = lhs_l.shape().elem_count();
-        let out_buf = self.device.alloc_buf(numel * 4)?;
+        let out_buf = self.device.alloc_buf(numel * byte_size)?;
         let info = self.device.upload_binary_info(lhs_l, rhs_l)?;
 
         self.device.with_module("binary", |module, _| {
             let func = module.get_function(&func_name).map_err(|e| err!("{e}"))?;
             let (grid, block) = launch_cfg(numel);
             let num_dims = lhs_l.dims().len();
-            let info_ptr: *const usize = info.as_ref().map_or(std::ptr::null(), |b| b.as_ptr());
-            let lhs_ptr =
-                unsafe { (self.buf.as_ptr() as *const f32).add(lhs_l.start_offset()) };
-            let rhs_ptr =
-                unsafe { (rhs.buf.as_ptr() as *const f32).add(rhs_l.start_offset()) };
-            let out_ptr = out_buf.as_mut_ptr() as *mut f32;
+            let info_ptr: *const usize =
+                info.as_ref().map_or(std::ptr::null(), |b| b.as_ptr());
+            let lhs_ptr = match self.dtype {
+                DType::F32 => unsafe { (self.buf.as_ptr() as *const f32).add(lhs_l.start_offset()) as *const _ },
+                DType::F16 => unsafe { (self.buf.as_ptr() as *const u16).add(lhs_l.start_offset()) as *const _ },
+                DType::BF16 => unsafe { (self.buf.as_ptr() as *const u16).add(lhs_l.start_offset()) as *const _ },
+                _ => unreachable!(),
+            };
+            let rhs_ptr = match self.dtype {
+                DType::F32 => unsafe { (rhs.buf.as_ptr() as *const f32).add(rhs_l.start_offset()) as *const _ },
+                DType::F16 => unsafe { (rhs.buf.as_ptr() as *const u16).add(rhs_l.start_offset()) as *const _ },
+                DType::BF16 => unsafe { (rhs.buf.as_ptr() as *const u16).add(rhs_l.start_offset()) as *const _ },
+                _ => unreachable!(),
+            };
+            let out_ptr_void = out_buf.as_mut_ptr() as *mut std::ffi::c_void;
             unsafe {
                 let mut params: Vec<*mut std::ffi::c_void> = vec![
                     &numel as *const _ as *mut _,
@@ -774,7 +1150,7 @@ impl BackendStorage for RocmStorage {
                     &info_ptr as *const _ as *mut _,
                     &lhs_ptr as *const _ as *mut _,
                     &rhs_ptr as *const _ as *mut _,
-                    &out_ptr as *const _ as *mut _,
+                    &out_ptr_void as *const _ as *mut _,
                 ];
                 HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
                     .map_err(|e| err!("{e}"))?;
@@ -783,7 +1159,7 @@ impl BackendStorage for RocmStorage {
         })?;
         Ok(RocmStorage {
             buf: out_buf,
-            dtype: DType::F32,
+            dtype: self.dtype,
             device: self.device.clone(),
         })
     }
@@ -852,11 +1228,51 @@ impl BackendStorage for RocmStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        // CPU fallback: download → conv1d on CPU → upload
-        let cpu_inp = self.to_cpu()?;
-        let cpu_ker = kernel.to_cpu()?;
-        let cpu_out = cpu_inp.conv1d(l, &cpu_ker, kernel_l, params)?;
-        self.device.storage_from_cpu_storage(&cpu_out)
+        // CPU fallback for non-F32/F16 or non-contiguous
+        if (self.dtype != DType::F32 && self.dtype != DType::F16)
+            || !l.is_contiguous()
+            || !kernel_l.is_contiguous()
+            || params.dilation != 1
+        {
+            let cpu_inp = self.to_cpu()?;
+            let cpu_ker = kernel.to_cpu()?;
+            let cpu_out = cpu_inp.conv1d(l, &cpu_ker, kernel_l, params)?;
+            return self.device.storage_from_cpu_storage(&cpu_out);
+        }
+
+        // Convert conv1d to conv2d via reshape: (B,C,L)->(B,C,1,L), (C_out,C_in,K)->(C_out,C_in,1,K)
+        let (b_size, c_in, l_in) = l.shape3()?;
+        let l_out = params.l_out();
+        let k_size = params.k_size;
+        let c_out = params.c_out;
+        let stride = params.stride;
+        let padding = params.padding;
+
+        // Build reshaped layouts for conv2d
+        let inp_layout_4d = Layout::contiguous((b_size, c_in, 1usize, l_in));
+        let ker_layout_4d = Layout::contiguous((c_out, c_in, 1usize, k_size));
+
+        // Build conv2d params
+        let conv2d_params = crate::conv::ParamsConv2D {
+            b_size,
+            c_in,
+            c_out,
+            k_h: 1,
+            k_w: k_size,
+            i_h: 1,
+            i_w: l_in,
+            padding,
+            stride,
+            dilation: 1,
+            cudnn_fwd_algo: None,
+        };
+
+        // Call GPU conv2d with reshaped layouts (same buffer, reinterpreted dims)
+        let out_storage = self.conv2d(l, kernel, kernel_l, &conv2d_params)?;
+
+        // Reshape output: (B, C_out, 1, L_out) → (B, C_out, L_out)
+        let out_layout_3d = Layout::contiguous((b_size, c_out, l_out));
+        out_storage.reshape(&out_layout_3d)
     }
 
     fn conv_transpose1d(
@@ -1029,9 +1445,64 @@ impl BackendStorage for RocmStorage {
         kernel_size: (usize, usize),
         stride: (usize, usize),
     ) -> Result<Self> {
-        let cpu_inp = self.to_cpu()?;
-        let cpu_out = cpu_inp.avg_pool2d(l, kernel_size, stride)?;
-        self.device.storage_from_cpu_storage(&cpu_out)
+        // CPU fallback for non-F32 or non-contiguous
+        if self.dtype != DType::F32 || !l.is_contiguous() {
+            let cpu_inp = self.to_cpu()?;
+            let cpu_out = cpu_inp.avg_pool2d(l, kernel_size, stride)?;
+            return self.device.storage_from_cpu_storage(&cpu_out);
+        }
+
+        let (b, c, ih, iw) = l.shape4()?;
+        let (kh, kw) = kernel_size;
+        let (sh, sw) = stride;
+        let oh = (ih + 2 * 0 - kh) / sh + 1;
+        let ow = (iw + 2 * 0 - kw) / sw + 1;
+        let total = b * c * oh * ow;
+        let elem_size = self.dtype.size_in_bytes();
+
+        let out_buf = self.device.alloc_buf(total * elem_size)?;
+        let in_ptr = unsafe {
+            (self.buf.as_ptr() as *const u8)
+                .add(l.start_offset() * elem_size) as *const std::ffi::c_void
+        };
+        let out_ptr = out_buf.as_void_ptr();
+
+        let kernel_name = match self.dtype {
+            DType::F32 => "avg_pool2d_f32",
+            _ => unreachable!(),
+        };
+        self.device.with_module("pool2d", |module, _blas| {
+            let func = module.get_function(kernel_name)
+                .map_err(|e| err!("get_function: {e}"))?;
+            let (grid, block) = crate::rocm_backend::launch_cfg(total);
+            let b_i = b as i32; let c_i = c as i32;
+            let ih_i = ih as i32; let iw_i = iw as i32;
+            let kh_i = kh as i32; let kw_i = kw as i32;
+            let sh_i = sh as i32; let sw_i = sw as i32;
+            let oh_i = oh as i32; let ow_i = ow as i32;
+            unsafe {
+                let mut p: Vec<*mut std::ffi::c_void> = vec![
+                    &in_ptr as *const _ as *mut _,
+                    &out_ptr as *const _ as *mut _,
+                    &b_i as *const _ as *mut _, &c_i as *const _ as *mut _,
+                    &ih_i as *const _ as *mut _, &iw_i as *const _ as *mut _,
+                    &kh_i as *const _ as *mut _, &kw_i as *const _ as *mut _,
+                    &0i32 as *const _ as *mut _,
+                    &0i32 as *const _ as *mut _,
+                    &sh_i as *const _ as *mut _, &sw_i as *const _ as *mut _,
+                    &oh_i as *const _ as *mut _, &ow_i as *const _ as *mut _,
+                ];
+                crate::rocm_backend::HipModule::launch(
+                    func, (grid, 1, 1), (block, 1, 1), 0, &mut p
+                ).map_err(|e| err!("avg_pool2d launch: {e}"))
+            }
+        })?;
+
+        Ok(RocmStorage {
+            buf: out_buf,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
     }
 
     fn max_pool2d(
@@ -1040,15 +1511,106 @@ impl BackendStorage for RocmStorage {
         kernel_size: (usize, usize),
         stride: (usize, usize),
     ) -> Result<Self> {
-        let cpu_inp = self.to_cpu()?;
-        let cpu_out = cpu_inp.max_pool2d(l, kernel_size, stride)?;
-        self.device.storage_from_cpu_storage(&cpu_out)
+        if self.dtype != DType::F32 || !l.is_contiguous() {
+            let cpu_inp = self.to_cpu()?;
+            let cpu_out = cpu_inp.max_pool2d(l, kernel_size, stride)?;
+            return self.device.storage_from_cpu_storage(&cpu_out);
+        }
+
+        let (b, c, ih, iw) = l.shape4()?;
+        let (kh, kw) = kernel_size;
+        let (sh, sw) = stride;
+        let oh = (ih + 2 * 0 - kh) / sh + 1;
+        let ow = (iw + 2 * 0 - kw) / sw + 1;
+        let total = b * c * oh * ow;
+        let elem_size = self.dtype.size_in_bytes();
+
+        let out_buf = self.device.alloc_buf(total * elem_size)?;
+        let in_ptr = unsafe {
+            (self.buf.as_ptr() as *const u8)
+                .add(l.start_offset() * elem_size) as *const std::ffi::c_void
+        };
+        let out_ptr = out_buf.as_void_ptr();
+
+        self.device.with_module("pool2d", |module, _blas| {
+            let func = module.get_function("max_pool2d_f32")
+                .map_err(|e| err!("{e}"))?;
+            let (grid, block) = crate::rocm_backend::launch_cfg(total);
+            let b_i = b as i32; let c_i = c as i32;
+            let ih_i = ih as i32; let iw_i = iw as i32;
+            let kh_i = kh as i32; let kw_i = kw as i32;
+            let sh_i = sh as i32; let sw_i = sw as i32;
+            let oh_i = oh as i32; let ow_i = ow as i32;
+            unsafe {
+                let mut p: Vec<*mut std::ffi::c_void> = vec![
+                    &in_ptr as *const _ as *mut _,
+                    &out_ptr as *const _ as *mut _,
+                    &b_i as *const _ as *mut _, &c_i as *const _ as *mut _,
+                    &ih_i as *const _ as *mut _, &iw_i as *const _ as *mut _,
+                    &kh_i as *const _ as *mut _, &kw_i as *const _ as *mut _,
+                    &0i32 as *const _ as *mut _,
+                    &0i32 as *const _ as *mut _,
+                    &sh_i as *const _ as *mut _, &sw_i as *const _ as *mut _,
+                    &oh_i as *const _ as *mut _, &ow_i as *const _ as *mut _,
+                ];
+                crate::rocm_backend::HipModule::launch(
+                    func, (grid, 1, 1), (block, 1, 1), 0, &mut p
+                ).map_err(|e| err!("max_pool2d launch: {e}"))
+            }
+        })?;
+
+        Ok(RocmStorage {
+            buf: out_buf,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
     }
 
     fn upsample_nearest1d(&self, l: &Layout, target_size: usize) -> Result<Self> {
-        let cpu_inp = self.to_cpu()?;
-        let cpu_out = cpu_inp.upsample_nearest1d(l, target_size)?;
-        self.device.storage_from_cpu_storage(&cpu_out)
+        if self.dtype != DType::F32 || !l.is_contiguous() {
+            let cpu_inp = self.to_cpu()?;
+            let cpu_out = cpu_inp.upsample_nearest1d(l, target_size)?;
+            return self.device.storage_from_cpu_storage(&cpu_out);
+        }
+
+        let (n, c, i_len) = l.shape3()?;
+        let o_len = target_size;
+        let total = n * c * o_len;
+        let elem_size = self.dtype.size_in_bytes();
+
+        let out_buf = self.device.alloc_buf(total * elem_size)?;
+        let in_ptr = unsafe {
+            (self.buf.as_ptr() as *const u8)
+                .add(l.start_offset() * elem_size) as *const std::ffi::c_void
+        };
+        let out_ptr = out_buf.as_void_ptr();
+
+        self.device.with_module("upsample", |module, _blas| {
+            let func = module.get_function("upsample_nearest1d_f32")
+                .map_err(|e| err!("{e}"))?;
+            let (grid, block) = crate::rocm_backend::launch_cfg(total);
+            let n_i = n as i32; let c_i = c as i32;
+            let i_i = i_len as i32; let o_i = o_len as i32;
+            unsafe {
+                let mut p: Vec<*mut std::ffi::c_void> = vec![
+                    &in_ptr as *const _ as *mut _,
+                    &out_ptr as *const _ as *mut _,
+                    &n_i as *const _ as *mut _,
+                    &c_i as *const _ as *mut _,
+                    &i_i as *const _ as *mut _,
+                    &o_i as *const _ as *mut _,
+                ];
+                crate::rocm_backend::HipModule::launch(
+                    func, (grid, 1, 1), (block, 1, 1), 0, &mut p
+                ).map_err(|e| err!("upsample_nearest1d launch: {e}"))
+            }
+        })?;
+
+        Ok(RocmStorage {
+            buf: out_buf,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
     }
 
     fn upsample_nearest2d(
@@ -1057,9 +1619,51 @@ impl BackendStorage for RocmStorage {
         target_h: usize,
         target_w: usize,
     ) -> Result<Self> {
-        let cpu_inp = self.to_cpu()?;
-        let cpu_out = cpu_inp.upsample_nearest2d(l, target_h, target_w)?;
-        self.device.storage_from_cpu_storage(&cpu_out)
+        if self.dtype != DType::F32 || !l.is_contiguous() {
+            let cpu_inp = self.to_cpu()?;
+            let cpu_out = cpu_inp.upsample_nearest2d(l, target_h, target_w)?;
+            return self.device.storage_from_cpu_storage(&cpu_out);
+        }
+
+        let (n, c, ih, iw) = l.shape4()?;
+        let oh = target_h;
+        let ow = target_w;
+        let total = n * c * oh * ow;
+        let elem_size = self.dtype.size_in_bytes();
+
+        let out_buf = self.device.alloc_buf(total * elem_size)?;
+        let in_ptr = unsafe {
+            (self.buf.as_ptr() as *const u8)
+                .add(l.start_offset() * elem_size) as *const std::ffi::c_void
+        };
+        let out_ptr = out_buf.as_void_ptr();
+
+        self.device.with_module("upsample", |module, _blas| {
+            let func = module.get_function("upsample_nearest2d_f32")
+                .map_err(|e| err!("{e}"))?;
+            let (grid, block) = crate::rocm_backend::launch_cfg(total);
+            let n_i = n as i32; let c_i = c as i32;
+            let ih_i = ih as i32; let iw_i = iw as i32;
+            let oh_i = oh as i32; let ow_i = ow as i32;
+            unsafe {
+                let mut p: Vec<*mut std::ffi::c_void> = vec![
+                    &in_ptr as *const _ as *mut _,
+                    &out_ptr as *const _ as *mut _,
+                    &n_i as *const _ as *mut _, &c_i as *const _ as *mut _,
+                    &ih_i as *const _ as *mut _, &iw_i as *const _ as *mut _,
+                    &oh_i as *const _ as *mut _, &ow_i as *const _ as *mut _,
+                ];
+                crate::rocm_backend::HipModule::launch(
+                    func, (grid, 1, 1), (block, 1, 1), 0, &mut p
+                ).map_err(|e| err!("upsample_nearest2d launch: {e}"))
+            }
+        })?;
+
+        Ok(RocmStorage {
+            buf: out_buf,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
     }
 
     fn upsample_bilinear2d(
@@ -1071,10 +1675,54 @@ impl BackendStorage for RocmStorage {
         scales_h: Option<f64>,
         scales_w: Option<f64>,
     ) -> Result<Self> {
-        let cpu_inp = self.to_cpu()?;
-        let cpu_out =
-            cpu_inp.upsample_bilinear2d(l, target_h, target_w, align_corners, scales_h, scales_w)?;
-        self.device.storage_from_cpu_storage(&cpu_out)
+        // scales not yet supported — fall back to CPU
+        if self.dtype != DType::F32 || !l.is_contiguous() || scales_h.is_some() || scales_w.is_some() {
+            let cpu_inp = self.to_cpu()?;
+            let cpu_out = cpu_inp.upsample_bilinear2d(l, target_h, target_w, align_corners, scales_h, scales_w)?;
+            return self.device.storage_from_cpu_storage(&cpu_out);
+        }
+
+        let (n, c, ih, iw) = l.shape4()?;
+        let oh = target_h;
+        let ow = target_w;
+        let total = n * c * oh * ow;
+        let elem_size = self.dtype.size_in_bytes();
+
+        let out_buf = self.device.alloc_buf(total * elem_size)?;
+        let in_ptr = unsafe {
+            (self.buf.as_ptr() as *const u8)
+                .add(l.start_offset() * elem_size) as *const std::ffi::c_void
+        };
+        let out_ptr = out_buf.as_void_ptr();
+
+        self.device.with_module("upsample", |module, _blas| {
+            let func = module.get_function("upsample_bilinear2d_f32")
+                .map_err(|e| err!("{e}"))?;
+            let (grid, block) = crate::rocm_backend::launch_cfg(total);
+            let n_i = n as i32; let c_i = c as i32;
+            let ih_i = ih as i32; let iw_i = iw as i32;
+            let oh_i = oh as i32; let ow_i = ow as i32;
+            let ac_i: i32 = if align_corners { 1 } else { 0 };
+            unsafe {
+                let mut p: Vec<*mut std::ffi::c_void> = vec![
+                    &in_ptr as *const _ as *mut _,
+                    &out_ptr as *const _ as *mut _,
+                    &n_i as *const _ as *mut _, &c_i as *const _ as *mut _,
+                    &ih_i as *const _ as *mut _, &iw_i as *const _ as *mut _,
+                    &oh_i as *const _ as *mut _, &ow_i as *const _ as *mut _,
+                    &ac_i as *const _ as *mut _,
+                ];
+                crate::rocm_backend::HipModule::launch(
+                    func, (grid, 1, 1), (block, 1, 1), 0, &mut p
+                ).map_err(|e| err!("upsample_bilinear2d launch: {e}"))
+            }
+        })?;
+
+        Ok(RocmStorage {
+            buf: out_buf,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
     }
 
     fn gather(
@@ -1187,6 +1835,67 @@ impl BackendStorage for RocmStorage {
         dim: usize,
     ) -> Result<Self> {
         if self.dtype != DType::F32 || !layout.is_contiguous() || !ids_l.is_contiguous() {
+            // BF16 index_select: use a dedicated kernel that reads BF16 weight, outputs BF16.
+            if (self.dtype == DType::BF16 || self.dtype == DType::F16)
+                && layout.is_contiguous()
+                && ids_l.is_contiguous()
+            {
+                let dims = layout.dims();
+                let left_size: usize = dims[..dim].iter().product();
+                let src_dim_size = dims[dim];
+                let ids_dim_size = ids_l.dims()[0];
+                let right_size: usize = dims[dim + 1..].iter().product::<usize>().max(1);
+                let numel = left_size * ids_dim_size * right_size;
+                let out_buf = self.device.alloc_buf(numel * 2)?;
+                let out_dtype = self.dtype;
+
+                let kernel_name = match (self.dtype, ids.dtype) {
+                    (DType::BF16, DType::U32) => "index_select_bf16",
+                    (DType::BF16, DType::I64) => "index_select_i64_bf16",
+                    (DType::F16, DType::U32) => "index_select_f16",
+                    (DType::F16, DType::I64) => "index_select_i64_f16",
+                    _ => {
+                        return Err(err!(
+                            "index_select: unsupported dtype combo {:?} {:?}",
+                            self.dtype,
+                            ids.dtype
+                        ))
+                    }
+                };
+                self.device.with_module("indexing", |module, _| {
+                    let func = module
+                        .get_function(kernel_name)
+                        .map_err(|e| err!("{e}"))?;
+                    let (grid, block) = launch_cfg(numel);
+                    let ids_ptr = unsafe {
+                        (ids.buf.as_ptr()).add(ids_l.start_offset() * ids.dtype.size_in_bytes())
+                    };
+                    let inp_ptr = unsafe {
+                        (self.buf.as_ptr() as *const u16).add(layout.start_offset())
+                    };
+                    let out_ptr = out_buf.as_mut_ptr() as *mut u16;
+                    unsafe {
+                        let mut params: Vec<*mut std::ffi::c_void> = vec![
+                            &numel as *const _ as *mut _,
+                            &ids_ptr as *const _ as *mut _,
+                            &inp_ptr as *const _ as *mut _,
+                            &out_ptr as *const _ as *mut _,
+                            &left_size as *const _ as *mut _,
+                            &src_dim_size as *const _ as *mut _,
+                            &ids_dim_size as *const _ as *mut _,
+                            &right_size as *const _ as *mut _,
+                        ];
+                        HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+                            .map_err(|e| err!("{e}"))?;
+                    }
+                    Ok(())
+                })?;
+                return Ok(RocmStorage {
+                    buf: out_buf,
+                    dtype: out_dtype,
+                    device: self.device.clone(),
+                });
+            }
             return self.cpu_fallback_binary(ids, layout, ids_l, |sc, ic, sl, il| {
                 sc.index_select(ic, sl, il, dim)
             });
@@ -1320,6 +2029,56 @@ impl BackendStorage for RocmStorage {
             }
         }
 
+        // BF16×BF16: dispatch via rocBLAS gemm_ex (BF16 I/O, F32 compute) below.
+
+        if self.dtype == DType::BF16
+            && matches!(rhs.dtype, DType::U32 | DType::I64)
+            && lhs_l.is_contiguous()
+            && rhs_l.is_contiguous()
+        {
+            let cpu_rhs = rhs.to_cpu()?;
+            let token_ids: Vec<u32> = match cpu_rhs {
+                CpuStorage::U32(ids) => ids,
+                CpuStorage::I64(ids) => ids.into_iter().map(|i| i as u32).collect(),
+                _ => unreachable!("cpu_rhs for embedding must be U32 or I64"),
+            };
+            let num_ids = token_ids.len();
+            // Collect rows from lhs BF16 on GPU via index_select helper.
+            let elem_size = 2; // BF16
+            let vocab_size = lhs_l.dims()[0];
+            let hidden = lhs_l.dims()[1];
+            let out_buf = self.device.alloc_buf(num_ids * hidden * elem_size)?;
+            self.device.with_module("indexing", |module, _| {
+                let func = module.get_function("index_select_bf16_bf16")
+                    .or_else(|_| module.get_function("index_select_bf16_f32"))
+                    .map_err(|e| err!("embedding index_select kernel: {e}"))?;
+                let numel = num_ids * hidden;
+                let (grid, block) = launch_cfg(numel);
+                let lhs_ptr = self.buf.as_ptr() as *const u8;
+                let rhs_ptr = rhs.buf.as_ptr() as *const u8;
+                let out_ptr = out_buf.as_mut_ptr();
+                let ids_ptr = rhs_ptr; // already cast below
+                let mut params: Vec<*mut std::ffi::c_void> = vec![
+                    &numel as *const _ as *mut _,
+                    &ids_ptr as *const _ as *mut _,
+                    &lhs_ptr as *const _ as *mut _,
+                    &out_ptr as *const _ as *mut _,
+                    &num_ids as *const _ as *mut _,
+                    &vocab_size as *const _ as *mut _,
+                    &hidden as *const _ as *mut _,
+                ];
+                unsafe {
+                    HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+                        .map_err(|e| err!("embedding kernel: {e}"))
+                }
+            })?;
+            return Ok(RocmStorage {
+                buf: out_buf,
+                dtype: DType::BF16,
+                device: self.device.clone(),
+            });
+        }
+
         if self.dtype != rhs.dtype {
             return self.cpu_fallback_binary(rhs, lhs_l, rhs_l, |lc, rc, ll, rl| {
                 lc.matmul(rc, (b, m, n, k), ll, rl)
@@ -1327,6 +2086,18 @@ impl BackendStorage for RocmStorage {
         }
 
         if !lhs_l.is_contiguous() || !rhs_l.is_contiguous() {
+            // For BF16 with non-contiguous layouts, we can't directly use GPU GEMM.
+            // Handle non-contiguous case on GPU by copying to contiguous buffers.
+            if self.dtype == DType::BF16 {
+                return self.matmul_non_contiguous_bf16(rhs, lhs_l, rhs_l, b, m, n, k);
+            }
+            // For F16 with non-contiguous layouts, use rocBLAS transpose flags.
+            // The most common case is weight.t() in Linear::forward — weight is
+            // [N, K] transposed to [K, N] with stride [N, 1], still usable via
+            // gemm(transA, ...) flags.
+            if self.dtype == DType::F16 {
+                return self.matmul_non_contiguous_f16(rhs, lhs_l, rhs_l, b, m, n, k);
+            }
             return self.cpu_fallback_binary(rhs, lhs_l, rhs_l, |lc, rc, ll, rl| {
                 lc.matmul(rc, (b, m, n, k), ll, rl)
             });
@@ -1427,51 +2198,75 @@ impl BackendStorage for RocmStorage {
                 })?;
             }
             DType::BF16 => {
-                // Use rocblas_gemm_ex with BF16 I/O, F32 compute.
-                // This is the standard path for BF16 on ROCm.
-                use hip_sys::rocblas;
-                let dt = rocblas::rocblas_datatype::rocblas_datatype_bf16_r;
-                let ct = rocblas::rocblas_compute_type::rocblas_compute_type_f32;
+                // BF16 GEMM: cast inputs to F16 on GPU, use rocBLAS hgemm, cast output back to BF16.
+                // rocBLAS gemm_ex with BF16 has issues on gfx1030; hgemm is well-supported.
+                let lhs_nelem = lhs_l.shape().elem_count();
+                let rhs_nelem = rhs_l.shape().elem_count();
+                let out_nelem = b * m * n;
+                let elem_size = 2usize;
+
+                // Cast lhs BF16→F16
+                let lhs_f16_buf = self.device.alloc_buf(lhs_nelem * elem_size)?;
+                self.cast_bf16_to_f16_on_gpu(&self.buf, &lhs_f16_buf, lhs_nelem, lhs_l.start_offset())?;
+
+                // Cast rhs BF16→F16
+                let rhs_f16_buf = self.device.alloc_buf(rhs_nelem * elem_size)?;
+                self.cast_bf16_to_f16_on_gpu(&rhs.buf, &rhs_f16_buf, rhs_nelem, rhs_l.start_offset())?;
+
+                // Allocate F16 output
+                let out_f16_buf = self.device.alloc_buf(out_nelem * elem_size)?;
+
+                let lhs_f16_ptr = lhs_f16_buf.as_ptr() as *const std::ffi::c_void;
+                let rhs_f16_ptr = rhs_f16_buf.as_ptr() as *const std::ffi::c_void;
+                let out_f16_ptr = out_f16_buf.as_mut_ptr() as *mut std::ffi::c_void;
+
+                // hgemm: C = A^T * B^T in col-major = C'[n,m] = B'[n,k] * A'[k,m]
+                let alpha: u16 = 0x3C00; // 1.0 in f16
+                let beta: u16 = 0x0000; // 0.0 in f16
                 self.device.with_blas(|blas| {
-                    // alpha/beta must be declared INSIDE the closure so the
-                    // pointer references remain valid for the FFI call lifetime.
-                    let alpha: f32 = 1.0;
-                    let beta: f32 = 0.0;
                     if b == 1 {
                         unsafe {
-                            blas.gemm_ex_raw(
+                            blas.hgemm_raw(
                                 false, false,
                                 n, m, k,
-                                &alpha as *const f32 as *const std::ffi::c_void,
-                                rhs_ptr, dt, n,
-                                lhs_ptr, dt, k,
-                                &beta as *const f32 as *const std::ffi::c_void,
-                                out_ptr, dt, n,
-                                ct,
+                                alpha,
+                                rhs_f16_ptr, n,
+                                lhs_f16_ptr, k,
+                                beta,
+                                out_f16_ptr, n,
                             )
-                            .map_err(|e| err!("gemm_ex (bf16) failed: {e}"))?;
+                            .map_err(|e| err!("hgemm (bf16→f16) failed: {e}"))?;
                         }
                     } else {
                         let stride_a = (k * n) as i64;
                         let stride_b = (m * k) as i64;
                         let stride_c = (m * n) as i64;
                         unsafe {
-                            blas.gemm_strided_batched_ex_raw(
+                            blas.hgemm_strided_batched_raw(
                                 false, false,
                                 n, m, k,
-                                &alpha as *const f32 as *const std::ffi::c_void,
-                                rhs_ptr, dt, n, stride_a,
-                                lhs_ptr, dt, k, stride_b,
-                                &beta as *const f32 as *const std::ffi::c_void,
-                                out_ptr, dt, n, stride_c,
+                                alpha,
+                                rhs_f16_ptr, n, stride_a,
+                                lhs_f16_ptr, k, stride_b,
+                                beta,
+                                out_f16_ptr, n, stride_c,
                                 b,
-                                ct,
                             )
-                            .map_err(|e| err!("gemm_strided_batched_ex (bf16) failed: {e}"))?;
+                            .map_err(|e| err!("hgemm_strided_batched (bf16→f16) failed: {e}"))?;
                         }
                     }
                     Ok(())
                 })?;
+
+                // Cast output F16→BF16
+                let out_buf = self.device.alloc_buf(out_nelem * elem_size)?;
+                self.cast_f16_to_bf16_on_gpu(&out_f16_buf, &out_buf, out_nelem)?;
+
+                return Ok(RocmStorage {
+                    buf: out_buf,
+                    dtype: DType::BF16,
+                    device: self.device.clone(),
+                });
             }
             _ => unreachable!(),
         }
@@ -1608,5 +2403,122 @@ impl BackendStorage for RocmStorage {
             .map_err(|e| err!("upload failed: {e}"))?;
         self.buf = new_buf;
         Ok(())
+    }
+}
+
+/// Extension methods for RocmStorage (not part of BackendStorage trait).
+impl RocmStorage {
+    /// Cast BF16 buffer to F16 on GPU using cast kernel.
+    pub(crate) fn cast_bf16_to_f16_on_gpu(
+        &self,
+        src_buf: &DeviceBuffer<u8>,
+        dst_buf: &DeviceBuffer<u8>,
+        numel: usize,
+        start_offset: usize,
+    ) -> Result<()> {
+        let inp_ptr = unsafe {
+            (src_buf.as_ptr() as *const u16).add(start_offset) as *const std::ffi::c_void
+        };
+        let out_ptr = dst_buf.as_mut_ptr() as *mut std::ffi::c_void;
+        self.device.with_module("cast", |module, _| {
+            let func = module
+                .get_function("cast_bf16_f16")
+                .map_err(|e| err!("cast_bf16_f16 kernel: {e}"))?;
+            let (grid, block) = launch_cfg(numel);
+            let num_dims: usize = 0;
+            let info_ptr: *const usize = std::ptr::null();
+            unsafe {
+                let mut params: Vec<*mut std::ffi::c_void> = vec![
+                    &numel as *const _ as *mut _,
+                    &num_dims as *const _ as *mut _,
+                    &info_ptr as *const _ as *mut _,
+                    &inp_ptr as *const _ as *mut _,
+                    &out_ptr as *const _ as *mut _,
+                ];
+                HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+                    .map_err(|e| err!("cast_bf16_f16 launch: {e}"))
+            }
+        })
+    }
+
+    /// Cast F16 buffer to BF16 on GPU using cast kernel.
+    pub(crate) fn cast_f16_to_bf16_on_gpu(
+        &self,
+        src_buf: &DeviceBuffer<u8>,
+        dst_buf: &DeviceBuffer<u8>,
+        numel: usize,
+    ) -> Result<()> {
+        let inp_ptr = src_buf.as_ptr() as *const std::ffi::c_void;
+        let out_ptr = dst_buf.as_mut_ptr() as *mut std::ffi::c_void;
+        self.device.with_module("cast", |module, _| {
+            let func = module
+                .get_function("cast_f16_bf16")
+                .map_err(|e| err!("cast_f16_bf16 kernel: {e}"))?;
+            let (grid, block) = launch_cfg(numel);
+            let num_dims: usize = 0;
+            let info_ptr: *const usize = std::ptr::null();
+            unsafe {
+                let mut params: Vec<*mut std::ffi::c_void> = vec![
+                    &numel as *const _ as *mut _,
+                    &num_dims as *const _ as *mut _,
+                    &info_ptr as *const _ as *mut _,
+                    &inp_ptr as *const _ as *mut _,
+                    &out_ptr as *const _ as *mut _,
+                ];
+                HipModule::launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+                    .map_err(|e| err!("cast_f16_bf16 launch: {e}"))
+            }
+        })
+    }
+
+    /// Handle BF16 matmul with non-contiguous layouts by copying to contiguous GPU buffers.
+    pub(crate) fn matmul_non_contiguous_bf16(
+        &self,
+        rhs: &Self,
+        lhs_l: &Layout,
+        rhs_l: &Layout,
+        b: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        // Copy both operands to contiguous BF16 on GPU
+        let lhs_cont = self.try_clone(lhs_l)?;
+        let rhs_cont = rhs.try_clone(rhs_l)?;
+
+        // Now call the contiguous matmul path
+        let lhs_l_cont =
+            Layout::contiguous_with_offset(lhs_l.shape().clone(), lhs_l.start_offset());
+        let rhs_l_cont =
+            Layout::contiguous_with_offset(rhs_l.shape().clone(), rhs_l.start_offset());
+
+        self.matmul(&rhs_cont, (b, m, n, k), &lhs_l_cont, &rhs_l_cont)
+    }
+
+    /// Handle F16 matmul with non-contiguous layouts by copying to contiguous GPU buffers.
+    /// This avoids the CPU fallback path which is extremely slow.
+    /// The GPU copy (via try_clone's copy_strided kernel) is microseconds;
+    /// the subsequent contiguous matmul uses fast rocBLAS hgemm (~900µs).
+    pub(crate) fn matmul_non_contiguous_f16(
+        &self,
+        rhs: &Self,
+        lhs_l: &Layout,
+        rhs_l: &Layout,
+        b: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        // Copy both operands to contiguous F16 on GPU
+        let lhs_cont = self.try_clone(lhs_l)?;
+        let rhs_cont = rhs.try_clone(rhs_l)?;
+
+        // Now call the contiguous matmul path
+        let lhs_l_cont =
+            Layout::contiguous_with_offset(lhs_l.shape().clone(), lhs_l.start_offset());
+        let rhs_l_cont =
+            Layout::contiguous_with_offset(rhs_l.shape().clone(), rhs_l.start_offset());
+
+        self.matmul(&rhs_cont, (b, m, n, k), &lhs_l_cont, &rhs_l_cont)
     }
 }

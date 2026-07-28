@@ -1,11 +1,18 @@
-use crate::backend::BackendStorage;
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
+#[allow(unused_imports)]
 use crate::{CpuStorage, DType, Layout, Result, Shape};
 use hip_runtime::blas::RocBlas;
 use hip_runtime::device::HipDevice;
 use hip_runtime::memory::DeviceBuffer;
 use hip_runtime::module::{compile_kernel, HipModule};
+use hip_runtime::rng::HipRng;
+use hip_runtime::stream::{HipEvent, HipStream};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io::Read;
+use std::rc::Rc;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +35,12 @@ struct RocmDeviceInner {
     arch: String,
     rng_seed: u64,
     rng_offset: u64,
+    /// Default async stream for pipelined operations.
+    /// Created lazily on first use via `stream()`.
+    default_stream: Option<HipStream>,
+    /// GPU random number generator (Philox 4x32-10).
+    /// Initialized lazily on first RNG call.
+    rng: Option<HipRng>,
 }
 
 impl std::fmt::Debug for RocmDeviceInner {
@@ -112,10 +125,33 @@ impl RocmDevice {
         }
         let src = inner.kernel_dir.join(format!("{kernel_name}.hip"));
         let out = inner.kernel_dir.join(format!("{kernel_name}.hsaco"));
-        if !out.exists() {
+        let hash_file = inner.kernel_dir.join(format!("{kernel_name}.src_hash"));
+
+        // Compute SHA-256 of source (includes arch in hash via arch-specific source paths)
+        let src_bytes = fs::read(&src)
+            .map_err(|e| crate::Error::Msg(format!("read {}: {e}", src.display())))?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        src_bytes.hash(&mut hasher);
+        let src_hash = format!("{:016x}", hasher.finish());
+
+        // Load existing hash if present
+        let cached_hash: Option<String> = fs::read_to_string(&hash_file)
+            .ok()
+            .map(|h| h.trim().to_string());
+
+        let needs_compile = if !out.exists() || cached_hash.as_ref() != Some(&src_hash) {
+            true
+        } else {
+            false
+        };
+
+        if needs_compile {
             compile_kernel(&src, &out, &inner.arch)
                 .map_err(|e| crate::Error::Msg(format!("kernel compile failed: {e}")))?;
+            // Write hash only after successful compile
+            let _ = fs::write(&hash_file, &src_hash);
         }
+
         let module = HipModule::load(&out)
             .map_err(|e| crate::Error::Msg(format!("module load failed: {e}")))?;
         inner.modules.insert(kernel_name.to_string(), module);
@@ -247,6 +283,8 @@ impl crate::backend::BackendDevice for RocmDevice {
                 arch,
                 rng_seed: 299792458,
                 rng_offset: 0,
+                default_stream: None,
+                rng: None,
             })),
         })
     }
@@ -300,22 +338,135 @@ impl crate::backend::BackendDevice for RocmDevice {
             device: self.clone(),
         })
     }
-
     fn rand_uniform(&self, shape: &Shape, dtype: DType, lo: f64, hi: f64) -> Result<Self::Storage> {
-        // Generate on CPU and upload for now
-        let cpu_storage = crate::cpu_backend::CpuDevice.rand_uniform(shape, dtype, lo, hi)?;
-        self.storage_from_cpu_storage(&cpu_storage)
+        if dtype != DType::F32 {
+            let cpu_storage = crate::cpu_backend::CpuDevice.rand_uniform(shape, dtype, lo, hi)?;
+            return self.storage_from_cpu_storage(&cpu_storage);
+        }
+
+        let n = shape.elem_count();
+        let mut lo_f = lo as f32;
+        let mut hi_f = hi as f32;
+        let mut n_u = n as u32;
+
+        // Lazy-init RNG
+        let kernel_dir = {
+            let inner = self.inner.lock().unwrap();
+            inner.kernel_dir.clone()
+        };
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.rng.is_none() {
+                let rng_new = HipRng::new(inner.rng_seed, &kernel_dir)
+                    .map_err(|e| crate::Error::Msg(format!("HipRng::new: {e}")))?;
+                inner.rng = Some(rng_new);
+            }
+        }
+
+        let mut rng = {
+            let inner = self.inner.lock().unwrap();
+            inner.rng.clone().unwrap()
+        };
+
+        let mut buf = DeviceBuffer::alloc(n)
+            .map_err(|e| crate::Error::Msg(format!("alloc: {e}")))?;
+        rng.uniform_f32(&mut buf)
+            .map_err(|e| crate::Error::Msg(format!("uniform_f32: {e}")))?;
+
+        // Scale to [lo, hi] if needed
+        if (lo_f != 0.0) || (hi_f != 1.0) {
+            let ptr = buf.as_mut_ptr() as *mut f32;
+            let mut ptrs: Vec<*mut std::ffi::c_void> = vec![
+                ptr as *mut _,
+                &mut n_u as *mut _ as *mut _,
+                &mut lo_f as *mut _ as *mut _,
+                &mut hi_f as *mut _ as *mut _,
+            ];
+            self.with_module("unary", |module, _blas| {
+                let func = module.get_function("map_scalar_f32")
+                    .map_err(|e| crate::Error::Msg(format!("get_function: {e}")))?;
+                let grid = (((n + 255) / 256) as u32, 1, 1);
+                let block = (256u32, 1, 1);
+                unsafe { HipModule::launch(func, grid, block, 0, &mut ptrs) }
+                    .map_err(|e| crate::Error::Msg(format!("launch: {e}")))
+            })?;
+        }
+
+        let storage = {
+            // Reinterpret f32 bytes as u8 (same underlying allocation, new dtype tag).
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    &buf as *const DeviceBuffer<f32> as *const u8,
+                    std::mem::size_of::<f32>() * n,
+                )
+            };
+            let buf_u8 = DeviceBuffer::from_slice(bytes)
+                .map_err(|e| crate::Error::Msg(format!("alloc: {e}")))?;
+            RocmStorage {
+                buf: buf_u8,
+                dtype,
+                device: self.clone(),
+            }
+        };
+        Ok(storage)
     }
 
     fn rand_normal(&self, shape: &Shape, dtype: DType, mean: f64, std: f64) -> Result<Self::Storage> {
-        let cpu_storage = crate::cpu_backend::CpuDevice.rand_normal(shape, dtype, mean, std)?;
-        self.storage_from_cpu_storage(&cpu_storage)
+        if dtype != DType::F32 {
+            let cpu_storage = crate::cpu_backend::CpuDevice.rand_normal(shape, dtype, mean, std)?;
+            return self.storage_from_cpu_storage(&cpu_storage);
+        }
+
+        let n = shape.elem_count();
+
+        // Lazy-init RNG
+        let kernel_dir = {
+            let inner = self.inner.lock().unwrap();
+            inner.kernel_dir.clone()
+        };
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.rng.is_none() {
+                let rng_new = HipRng::new(inner.rng_seed, &kernel_dir)
+                    .map_err(|e| crate::Error::Msg(format!("HipRng::new: {e}")))?;
+                inner.rng = Some(rng_new);
+            }
+        }
+
+        let mut rng = {
+            let inner = self.inner.lock().unwrap();
+            inner.rng.clone().unwrap()
+        };
+
+        let mut buf = DeviceBuffer::alloc(n)
+            .map_err(|e| crate::Error::Msg(format!("alloc: {e}")))?;
+        rng.normal_f32(&mut buf, mean as f32, std as f32)
+            .map_err(|e| crate::Error::Msg(format!("normal_f32: {e}")))?;
+
+        let storage = {
+            // Reinterpret f32 bytes as u8 (same underlying allocation, new dtype tag).
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    &buf as *const DeviceBuffer<f32> as *const u8,
+                    std::mem::size_of::<f32>() * n,
+                )
+            };
+            let buf_u8 = DeviceBuffer::from_slice(bytes)
+                .map_err(|e| crate::Error::Msg(format!("alloc: {e}")))?;
+            RocmStorage {
+                buf: buf_u8,
+                dtype,
+                device: self.clone(),
+            }
+        };
+        Ok(storage)
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.rng_seed = seed;
         inner.rng_offset = 0;
+        inner.rng = None; // Force re-init on next RNG call
         Ok(())
     }
 
@@ -330,6 +481,65 @@ impl crate::backend::BackendDevice for RocmDevice {
             ._device
             .synchronize()
             .map_err(|e| crate::Error::Msg(format!("synchronize failed: {e}")))
+    }
+}
+
+impl RocmDevice {
+    /// Lazily creates (or recreates) the GPU RNG, reusing the current seed.
+    fn get_or_init_rng(&self) -> Result<Rc<RefCell<HipRng>>> {
+        let kernel_dir = {
+            let inner = self.inner.lock().unwrap();
+            inner.kernel_dir.clone()
+        };
+        let mut inner = self.inner.lock().unwrap();
+        if inner.rng.is_none() {
+            let rng = HipRng::new(inner.rng_seed, &kernel_dir)
+                .map_err(|e| crate::Error::Msg(format!("HipRng::new: {e}")))?;
+            inner.rng = Some(rng);
+        }
+        Ok(Rc::new(RefCell::new(inner.rng.clone().unwrap())))
+    }
+    /// Returns the device's default async stream, creating it lazily on first call.
+    /// This stream is used for all async copy operations (`hipMemcpyAsync`, etc.)
+    /// that don't specify an explicit stream.
+    pub fn stream(&self) -> Result<HipStream> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(ref s) = inner.default_stream {
+            return Ok(s.clone());
+        }
+        let stream = HipStream::new()
+            .map_err(|e| crate::Error::Msg(format!("HipStream::new failed: {e}")))?;
+        inner.default_stream = Some(stream.clone());
+        Ok(stream)
+    }
+
+    /// Creates a new independent async stream (not shared with the device default).
+    /// Useful for custom pipeline stages where you need explicit ordering via events.
+    pub fn create_stream(&self) -> Result<HipStream> {
+        HipStream::new()
+            .map_err(|e| crate::Error::Msg(format!("HipStream::new failed: {e}")))
+    }
+
+    /// Creates a CUDA-event-like marker on the device's default stream.
+    /// Used to record ordering points between streams.
+    pub fn record_event(&self) -> Result<HipEvent> {
+        let stream = self.stream()?;
+        HipEvent::signaling()
+            .map_err(|e| crate::Error::Msg(format!("HipEvent::signaling failed: {e}")))
+            .and_then(|event| {
+                event
+                    .record(&stream)
+                    .map_err(|e| crate::Error::Msg(format!("record failed: {e}")))?;
+                Ok(event)
+            })
+    }
+
+    /// Explicitly synchronize the device's default stream.
+    pub fn stream_synchronize(&self) -> Result<()> {
+        let stream = self.stream()?;
+        stream
+            .synchronize()
+            .map_err(|e| crate::Error::Msg(format!("stream synchronize failed: {e}")))
     }
 }
 

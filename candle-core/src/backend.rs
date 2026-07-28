@@ -15,6 +15,11 @@ pub trait BackendStorage: Sized {
     // Maybe this should return a Cow instead so that no copy is done on the cpu case.
     fn to_cpu_storage(&self) -> Result<CpuStorage>;
 
+    fn reshape(&self, layout: &Layout) -> Result<Self> {
+        // Reshape changes logical view only — no data movement needed.
+        self.try_clone(layout)
+    }
+
     fn affine(&self, _: &Layout, _: f64, _: f64) -> Result<Self>;
 
     fn powf(&self, _: &Layout, _: f64) -> Result<Self>;

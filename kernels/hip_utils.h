@@ -32,8 +32,7 @@ __device__ __forceinline__ bool is_contiguous(const size_t *info) {
 
 // On Ubuntu-packaged ROCm, glibc <math.h> declares host-only math functions
 // that conflict with HIP device intrinsics. Declare device-side versions
-// using LLVM intrinsics and OCML (AMD's OpenCL Math Library) for functions
-// without LLVM intrinsics (like tanhf, erff, powf).
+// using LLVM intrinsics and OCML (AMD's OpenCL Math Library).
 #ifdef __HIP_DEVICE_COMPILE__
 extern "C" {
 // LLVM intrinsics (always available)
@@ -49,21 +48,25 @@ __device__ float truncf(float) __asm__("llvm.trunc.f32");
 __device__ float fmaxf(float, float) __asm__("llvm.maxnum.f32");
 __device__ float fminf(float, float) __asm__("llvm.minnum.f32");
 
-// OCML functions (tanhf, erff, powf): provided by __clang_hip_math.h when
-// compiled via Rust (-include hip/hip_runtime.h), but missing on standalone
-// hipcc --genco. Use OCML directly to avoid glibc __host__ conflict.
-// Guard: skip if __clang_hip_math.h already defined them.
-#ifdef __HIP_DEVICE_COMPILE__
-#ifndef __CLANG_HIP_MATH_H__
-extern "C" {
+// OCML functions (no LLVM intrinsic for these)
 __device__ float __ocml_tanh_f32(float);
 __device__ float __ocml_erf_f32(float);
 __device__ float __ocml_pow_f32(float, float);
-}
+__device__ float __ocml_sqrt_f32(float);
+
+// Inline wrappers: bypass glibc __host__ overloads.
+// When the runtime JIT compiler uses -include hip/hip_runtime.h, __clang_hip_math.h
+// already defines these. When compiling standalone (hipcc --genco), it doesn't.
+// Use __clang_hip_math_h guard to detect which case we're in.
+#ifndef __CLANG_HIP_MATH_H__
 __device__ __forceinline__ float tanhf(float x) { return __ocml_tanh_f32(x); }
 __device__ __forceinline__ float erff(float x) { return __ocml_erf_f32(x); }
 __device__ __forceinline__ float powf(float x, float y) { return __ocml_pow_f32(x, y); }
-#endif
+__device__ __forceinline__ float sqrtf(float x) {
+    float r;
+    asm("v_sqrt_f32 %0, %1" : "=v"(r) : "v"(x));
+    return r;
+}
 #endif
 }
 #endif

@@ -36,6 +36,34 @@ impl Layout {
         self.shape.dims()
     }
 
+    /// Shape3 wrapper for 3D tensors.
+    pub fn shape3(&self) -> Result<(usize, usize, usize)> {
+        let dims = self.shape.dims();
+        if dims.len() != 3 {
+            Err(crate::Error::Msg(format!(
+                "expected shape3 but got {:?}",
+                dims
+            ))
+            .bt())
+        } else {
+            Ok((dims[0], dims[1], dims[2]))
+        }
+    }
+
+    /// Shape4 wrapper for 4D tensors.
+    pub fn shape4(&self) -> Result<(usize, usize, usize, usize)> {
+        let dims = self.shape.dims();
+        if dims.len() != 4 {
+            Err(crate::Error::Msg(format!(
+                "expected shape4 but got {:?}",
+                dims
+            ))
+            .bt())
+        } else {
+            Ok((dims[0], dims[1], dims[2], dims[3]))
+        }
+    }
+
     /// The dimension size for a specified dimension index.
     pub fn dim<D: crate::shape::Dim>(&self, dim: D) -> Result<usize> {
         let dim = dim.to_index(&self.shape, "dim")?;

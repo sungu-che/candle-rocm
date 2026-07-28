@@ -76,12 +76,23 @@ impl Storage {
 
     pub(crate) fn same_dtype(&self, rhs: &Self, op: &'static str) -> Result<()> {
         let lhs = self.dtype();
-        let rhs = rhs.dtype();
-        if lhs != rhs {
-            Err(Error::DTypeMismatchBinaryOp { lhs, rhs, op }.bt())
-        } else {
-            Ok(())
+        let rhs_dt = rhs.dtype();
+        if lhs != rhs_dt {
+            // Allow BF16 × U32/I64 for embedding lookup (matmul dispatch path).
+            let mixed_ok = matches!(
+                (lhs, rhs_dt, op),
+                (DType::BF16, DType::U32, "matmul") | (DType::BF16, DType::I64, "matmul")
+            );
+            if !mixed_ok {
+                return Err(Error::DTypeMismatchBinaryOp {
+                    lhs,
+                    rhs: rhs_dt,
+                    op,
+                }
+                .bt());
+            }
         }
+        Ok(())
     }
 
     pub(crate) fn const_set(&mut self, v: Scalar, l: &Layout) -> Result<()> {
@@ -467,7 +478,8 @@ impl Storage {
             let rhs_cast = rhs.to_dtype(rhs_layout, lhs_dt)?;
             return self.binary_impl::<B>(&rhs_cast, lhs_layout, rhs_layout);
         }
-        self.same_dtype(rhs, B::NAME)?;
+        // Let each device backend handle dtype mismatches internally
+        // (e.g. via cpu_fallback_binary for ROCm, or automatic cast for CUDA)
         match (self, rhs) {
             (Storage::Cpu(lhs), Storage::Cpu(rhs)) => {
                 let storage = lhs.binary_impl::<B>(rhs, lhs_layout, rhs_layout)?;

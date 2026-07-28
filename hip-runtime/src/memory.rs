@@ -1,8 +1,10 @@
 //! Typed GPU memory buffers with RAII.
 
 use crate::error::{check_hip, Result};
+use crate::stream::HipStream;
 use hip_sys::hip_runtime::{self, hipMemcpyKind};
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 
 /// Typed GPU memory buffer with RAII.
 pub struct DeviceBuffer<T> {
@@ -45,20 +47,67 @@ impl<T: Copy> DeviceBuffer<T> {
 
     /// Copy device buffer back to host.
     pub fn to_vec(&self) -> Result<Vec<T>> {
-        // SAFETY: `result` is zero-filled as a placeholder; hipMemcpy fully
-        // overwrites every element before the caller reads any of them.
-        // This pattern avoids the need to heap-allocate a typed buffer on
-        // the Rust side while still being safe.
-        let mut result = vec![unsafe { std::mem::zeroed() }; self.len];
+        let mut result: Vec<MaybeUninit<T>> = Vec::with_capacity(self.len);
+        // Allocate uninitialized backing store
+        let ptr = result.as_mut_ptr();
+        std::mem::forget(result);
+
         let bytes = self.len * std::mem::size_of::<T>();
         check_hip(unsafe {
             hip_runtime::hipMemcpy(
-                result.as_mut_ptr() as *mut _,
+                ptr as *mut _,
                 self.ptr,
                 bytes,
                 hipMemcpyKind::hipMemcpyDeviceToHost,
             )
         })?;
+
+        // SAFETY: hipMemcpy fully overwrote every element. Re-interpret from
+        // MaybeUninit to initialized T. This matches the std library pattern
+        // for reading from potentially-uninitialized memory that was actually
+        // fully initialized by the copy.
+        let result = unsafe { Vec::from_raw_parts(ptr as *mut T, self.len, self.len) };
+        Ok(result)
+    }
+
+    /// Asynchronously copy from host slice to device.
+    /// The copy is enqueued on the given stream and may not be complete
+    /// when this function returns. Use `stream.synchronize()` to wait.
+    pub fn from_slice_async(data: &[T], stream: &HipStream) -> Result<Self> {
+        let buf = Self::alloc(data.len())?;
+        let bytes = data.len() * std::mem::size_of::<T>();
+        check_hip(unsafe {
+            hip_runtime::hipMemcpyAsync(
+                buf.ptr,
+                data.as_ptr() as *const _,
+                bytes,
+                hipMemcpyKind::hipMemcpyHostToDevice,
+                stream.as_raw(),
+            )
+        })?;
+        Ok(buf)
+    }
+
+    /// Asynchronously copy device buffer back to host.
+    /// The copy is enqueued on the given stream and may not be complete
+    /// when this function returns. Use `stream.synchronize()` to wait.
+    pub fn to_vec_async(&self, stream: &HipStream) -> Result<Vec<T>> {
+        let mut result: Vec<MaybeUninit<T>> = Vec::with_capacity(self.len);
+        let ptr = result.as_mut_ptr();
+        std::mem::forget(result);
+
+        let bytes = self.len * std::mem::size_of::<T>();
+        check_hip(unsafe {
+            hip_runtime::hipMemcpyAsync(
+                ptr as *mut _,
+                self.ptr,
+                bytes,
+                hipMemcpyKind::hipMemcpyDeviceToHost,
+                stream.as_raw(),
+            )
+        })?;
+
+        let result = unsafe { Vec::from_raw_parts(ptr as *mut T, self.len, self.len) };
         Ok(result)
     }
 
@@ -107,6 +156,23 @@ impl DeviceBuffer<u8> {
                     bytes.as_ptr() as *const _,
                     bytes.len(),
                     hipMemcpyKind::hipMemcpyHostToDevice,
+                )
+            })?;
+        }
+        Ok(buf)
+    }
+
+    /// Async version of `from_host_bytes`. Enqueues the copy on a stream.
+    pub fn from_host_bytes_async(bytes: &[u8], stream: &HipStream) -> Result<Self> {
+        let buf = Self::alloc(bytes.len())?;
+        if !bytes.is_empty() {
+            check_hip(unsafe {
+                hip_runtime::hipMemcpyAsync(
+                    buf.ptr,
+                    bytes.as_ptr() as *const _,
+                    bytes.len(),
+                    hipMemcpyKind::hipMemcpyHostToDevice,
+                    stream.as_raw(),
                 )
             })?;
         }
